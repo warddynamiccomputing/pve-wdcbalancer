@@ -1,6 +1,6 @@
 # pve-wdcbalancer guide
 
-Version 0.2.0
+Version 0.3.0
 
 How the balancer works, how it maps to vSphere DRS, and how to configure it.
 
@@ -9,7 +9,7 @@ How the balancer works, how it maps to vSphere DRS, and how to configure it.
 | vSphere DRS | pve-wdcbalancer | Notes |
 | --- | --- | --- |
 | DRS cluster | the Proxmox VE cluster | one configuration per cluster, on pmxcfs (`/etc/pve/wdcbalancer/`) |
-| Automation level: Manual / Partially / Fully Automated | `automation`: `manual` / `partial` / `full` | `partial` places guests at power-on from 0.3 |
+| Automation level: Manual / Partially / Fully Automated | `automation`: `manual` / `partial` / `full` | |
 | Migration threshold 1–5 | `threshold` 1–5 | same meaning: a recommendation is shown when its priority ≤ threshold |
 | VM DRS score, cluster DRS score | VM score, cluster score | 0–100 %, same buckets |
 | Run DRS Now | **Run now**, `wdcbalancer run` | |
@@ -23,8 +23,8 @@ How the balancer works, how it maps to vSphere DRS, and how to configure it.
 | EVC | CPU check | guests with `cpu: host` (or `max`) only move between identical CPUs |
 | vMotion | live migration | containers: restart migration; HA guests: HA migration |
 | DRS rules honoured by vSphere HA | rules mirrored into native HA rules | for HA guests |
-| Maintenance mode | 0.3 | nodes in HA maintenance are already avoided |
-| Initial placement | 0.3 (Power On (balanced)) | placement explanation already available |
+| Maintenance mode (Enter / Exit) | Maintenance mode (Enter / Exit) | Datacenter or node panel, CLI |
+| Initial placement at power-on | Power On (balanced) | Proxmox's own Start button isn't changed |
 | DPM, resource pools | not planned | |
 | Storage DRS | pve-fcsan (datastore clusters) | |
 
@@ -195,8 +195,8 @@ auto-rebalancing is on.
 
 | Level | What happens |
 | --- | --- |
-| `manual` | Recommendations only. |
-| `partial` | Recommendations only for balancing; from 0.3, guests are placed automatically at **Power On (balanced)**. |
+| `manual` | Recommendations only; **Power On (balanced)** shows the ranking of nodes and you pick. |
+| `partial` | Recommendations only for balancing; **Power On (balanced)** places guests automatically. |
 | `full` | After each pass, the timer applies the recommendations within the threshold in an apply task. |
 
 Per-VM overrides take precedence:
@@ -207,6 +207,55 @@ Per-VM overrides take precedence:
 With full automation, containers are moved only when `containers` is
 `restart`. Otherwise they stay as recommendations, because moving them
 restarts them.
+
+## Maintenance mode
+
+**Enter maintenance mode** (Datacenter → Load Balancing → Maintenance, the
+node's own **Load Balancing** panel, or `wdcbalancer maintenance enter
+<node> [--move-stopped 1]`) starts a task (`wdcbmaint`):
+
+1. The node is marked in the configuration. From now on no pass places
+   anything there, and every pass recommends moving its running guests
+   (priority 1, at every threshold).
+2. If the node has HA guests, the HA manager's own node maintenance is turned
+   on, so HA moves them and doesn't bring them back.
+3. The other running guests are moved now, whatever the automation level:
+   entering maintenance mode is an explicit request, as in vSphere. Moves are
+   chosen like any other (rules, memory, scores) and repeated for up to five
+   rounds while guests are still moving.
+4. With **move stopped guests**, the powered-off guests are moved too
+   (offline; on shared storage only their config moves).
+5. Guests that can't be moved (local disks, passthrough, a rule that leaves
+   them nowhere) are listed. The task then fails, but the node stays in
+   maintenance mode, so you can move or shut down those guests yourself.
+
+**Exit maintenance mode** removes the mark (and HA node maintenance, if it
+turned it on). Later passes balance onto the node again.
+
+## Initial placement (Power On (balanced))
+
+**Power On (balanced)** (Guests tab, `wdcbalancer poweron <vmids>`) starts
+stopped guests on the best node:
+
+- A stopped guest has no usage yet, so its expected demand is a quarter of
+  its configured cores and all of its configured memory.
+- Guests started together are placed one after the other, each counting for
+  the next, so they spread out.
+- Placement honours the same constraints and rules as balancing: shared
+  storage (a guest on local storage starts where its disk is), memory with
+  headroom, CPU type, nodes in maintenance, *must* rules, *separate* from
+  running members, *together* with running partners. It prefers nodes that
+  meet *should* rules.
+- A guest on another node is moved there offline first, then started. HA
+  guests are started through HA (`ha-manager set ... --state started`), and
+  the HA manager's CRS places them.
+
+With **manual** automation, Power On for one guest shows the ranking of nodes
+(VM score there, or why not) and you pick. With **partial** and **full** it
+places at once. `wdcbalancer placement <vmids>` shows the placement without
+starting anything.
+
+Proxmox's own **Start** button is not changed: it starts a guest where it is.
 
 ## HA rules
 
@@ -272,6 +321,11 @@ the configuration and the last pass are cluster-wide.
 | `recommendations` | GET | |
 | `apply` | POST `ids` (optional) | apply recommendations in a task; also needs `VM.Migrate` on each guest |
 | `ha-sync` | POST | mirror the rules into HA rules now |
+| `maintenance` | GET | maintenance state of every node |
+| `maintenance/{host}/enter` | POST `move-stopped` | enter maintenance mode (a task); needs `VM.Migrate` on `/vms` too |
+| `maintenance/{host}/exit` | POST | |
+| `placement` | GET `vmids` | where stopped guests would start |
+| `poweron` | POST `vmids`, `target` | Power On (balanced) (a task); needs `VM.PowerMgmt` and `VM.Migrate` on each guest |
 | `dismiss` | POST `id` | |
 | `run` | POST | Run DRS now |
 | `guests` | GET | VM scores and movability |

@@ -51,7 +51,9 @@ like($hook, qr/me\.callParent\(arguments\)/, 'always calls the parent');
 my $dc = class_body('PVE.wdcb.DcPanel') // '';
 is_deeply([ $dc =~ /xtype: '(pveWdcb\w+)'/g ],
     [ qw(pveWdcbSummary pveWdcbRecGrid pveWdcbGuestGrid pveWdcbFaultGrid pveWdcbHistoryGrid pveWdcbSettingsView
-        pveWdcbGroupGrid pveWdcbRuleGrid pveWdcbOverrideGrid) ], 'datacenter tabs');
+        pveWdcbGroupGrid pveWdcbRuleGrid pveWdcbOverrideGrid pveWdcbMaintenanceGrid) ], 'datacenter tabs');
+like($hook, qr/\$className === 'PVE\.node\.Config'.*pveWdcbNodePanel/s, 'node menu entry');
+like($js, qr/enableFn: rec => rec.data.status === 'stopped'/, 'Power On only for stopped guests');
 for my $x ($dc =~ /xtype: '(pveWdcb\w+)'/g) {
     like($js, qr/alias: 'widget\.\Q$x\E'/, "$x is defined");
 }

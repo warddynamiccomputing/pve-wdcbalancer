@@ -102,6 +102,13 @@ our $cmddef = {
     history => [ $api, 'history', [], $node, $print_history, $fmt ],
     apply => [ $api, 'apply', [], $node, $task ],
     'ha-sync' => [ $api, 'ha_sync', [], $node, $print_obj, $fmt ],
+    maintenance => {
+        list => [ $api, 'maintenance', [], $node, $table->(qw(node state since user running blocked)), $fmt ],
+        enter => [ $api, 'maintenance_enter', ['host'], $node, $task ],
+        exit => [ $api, 'maintenance_exit', ['host'], $node ],
+    },
+    placement => [ $api, 'placement', ['vmids'], $node, $table->(qw(vmid name from to score reason)), $fmt ],
+    poweron => [ $api, 'poweron', ['vmids'], $node, $task ],
     explain => [ $api, 'explain', ['vmid'], $node, $table->(qw(node current ok score gain cpu mem reason)), $fmt ],
 
     settings => {

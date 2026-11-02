@@ -441,6 +441,107 @@ sub explain {
     return \@rows;
 }
 
+# Initial placement of stopped guests (Power On (balanced)), like DRS at
+# power-on. A stopped guest has no usage yet, so its expected demand is a
+# share of its configured cores ($INITIAL_CPU) and all of its memory.
+# Guests are placed one after the other, each counting for the next.
+# Returns [ { vmid, from, to, score, reason?, ranking => [ { node, ok, score, reason } ] } ].
+our $INITIAL_CPU = 0.25;
+
+sub place {
+    my ($snap, $cfg, $vmids) = @_;
+    my $settings = PVE::WDCBalancer::Config::settings($cfg);
+    my @all_nodes = sort keys %{$snap->{nodes}};
+    my $rules = PVE::WDCBalancer::Config::enabled_rules($cfg);
+    my $units = together_units($cfg);
+
+    my %placement;
+    for my $id (keys %{$snap->{guests}}) {
+        my $x = $snap->{guests}->{$id};
+        $placement{$id} = $x->{node} if ($x->{status} // '') eq 'running' && $snap->{nodes}->{$x->{node} // ''};
+    }
+
+    my @res;
+    for my $vmid (@$vmids) {
+        my $g = $snap->{guests}->{$vmid};
+        if (!$g) {
+            push @res, { vmid => $vmid + 0, reason => 'unknown guest' };
+            next;
+        }
+        if (($g->{status} // '') eq 'running') {
+            push @res, { vmid => $vmid + 0, from => $g->{node}, reason => 'already running' };
+            next;
+        }
+        # expected demand while running
+        $snap->{guests}->{$vmid} = { %$g, cpu => ($g->{maxcpu} || 1) * $INITIAL_CPU, mem => $g->{maxmem},
+            memhost => $g->{maxmem}, netin => 0, netout => 0, psi_cpu => 0, psi_mem => 0 };
+        delete $snap->{_demand};
+        my $ev = PVE::WDCBalancer::Score::evaluate($snap, \%placement, $settings);
+
+        # a stopped guest can only change node if it could be moved at all
+        my %g2 = (%{$snap->{guests}->{$vmid}}, status => 'running');
+        local $snap->{guests}->{$vmid} = \%g2;
+        my ($movable, $why) = PVE::WDCBalancer::Constraints::movable($snap, $cfg, $vmid);
+
+        my @rank;
+        for my $node (@all_nodes) {
+            my %row = (node => $node);
+            my ($ok, $reason) = (1);
+            if ($node ne $g->{node} && !$movable) {
+                ($ok, $reason) = (0, $why);
+            } else {
+                ($ok, $reason) = PVE::WDCBalancer::Constraints::can_run($snap, $cfg, $vmid, $node);
+            }
+            if ($ok && !PVE::WDCBalancer::Constraints::fits($snap, $settings, $ev->{loads}->{$node}, $vmid, $node)) {
+                ($ok, $reason) = (0, "not enough memory on $node");
+            }
+            if ($ok) {
+                for my $r (grep { $_->{type} eq 'separate' } @$rules) {
+                    next if !grep { $_ == $vmid } @{$r->{vms}};
+                    my ($other) = grep { $_ != $vmid && ($placement{$_} // '') eq $node } @{$r->{vms}};
+                    ($ok, $reason) = (0, "rule '$r->{name}' keeps it apart from $other") if $other;
+                }
+            }
+            if ($ok) {
+                my @partners = grep { $_ != $vmid && defined($placement{$_}) } @{ $units->{$vmid} // [] };
+                my ($away) = grep { $placement{$_} ne $node } @partners;
+                ($ok, $reason) = (0, "a keep-together rule ties it to $away on $placement{$away}") if $away;
+            }
+            $row{ok} = $ok ? 1 : 0;
+            if ($ok) {
+                my $soft = 0;
+                for my $r (grep { $_->{type} eq 'vm-host' && $_->{mode} =~ /^should/ } @$rules) {
+                    next if !grep { $_ == $vmid } @{ PVE::WDCBalancer::Config::rule_vms($cfg, $r) };
+                    my $in = grep { $_ eq $node } @{ PVE::WDCBalancer::Config::rule_hosts($cfg, $r) };
+                    $soft++ if $r->{mode} eq 'should' ? !$in : $in;
+                }
+                $row{soft} = $soft;
+                my %p = (%placement, $vmid => $node);
+                my $after = PVE::WDCBalancer::Score::evaluate($snap, \%p, $settings);
+                $row{score} = sprintf('%.0f', $after->{scores}->{$vmid}) + 0;
+                $row{objective} = $after->{objective};
+            } else {
+                $row{reason} = $reason;
+            }
+            push @rank, \%row;
+        }
+        my ($best) = sort { $a->{soft} <=> $b->{soft} || $b->{objective} <=> $a->{objective}
+            || ($a->{node} eq $g->{node} ? -1 : $b->{node} eq $g->{node} ? 1 : $a->{node} cmp $b->{node}) }
+            grep { $_->{ok} } @rank;
+        delete $_->{objective} for @rank;
+        if (!$best) {
+            push @res, { vmid => $vmid + 0, from => $g->{node}, reason => 'no node can run it', ranking => \@rank };
+            $snap->{guests}->{$vmid} = $g;
+            next;
+        }
+        $placement{$vmid} = $best->{node};
+        push @res, { vmid => $vmid + 0, name => $g->{name} // '', type => $g->{type}, ha => $g->{ha} ? 1 : 0,
+            from => $g->{node}, to => $best->{node}, score => $best->{score}, ranking => \@rank };
+    }
+    delete $snap->{_demand};
+    return \@res;
+}
+
 # vSphere-style reason for a balancing move
 sub balance_reason {
     my ($snap, $ev, $placement, $unit, $target, $settings) = @_;

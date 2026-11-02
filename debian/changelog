@@ -1,3 +1,17 @@
+pve-wdcbalancer (0.3.0) trixie; urgency=medium
+
+  * Maintenance mode per node (Datacenter > Load Balancing > Maintenance,
+    Node > Load Balancing, wdcbalancer maintenance): running guests are
+    moved off now, HA guests through HA node maintenance, optionally the
+    stopped ones too; what cannot move is reported. Nothing is placed on a
+    node in maintenance.
+  * Power On (balanced): stopped guests are started on the best node, moved
+    there offline first; with manual automation the placement is shown to
+    pick from. HA guests are started through HA.
+  * Stopped guests are moved offline (on shared storage only the config).
+
+ -- pve-wdcbalancer maintainers <maintainers@example.invalid>  Mon, 02 Nov 2026 22:23:22 +0000
+
 pve-wdcbalancer (0.2.0) trixie; urgency=medium
 
   * Recommendations can be applied: live migration for VMs, restart
