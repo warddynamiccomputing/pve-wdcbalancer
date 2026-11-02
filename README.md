@@ -93,7 +93,7 @@ wdcbalancer poweron 201,202        # Power On (balanced)
 1. **0.1:** scores, recommendations, rules, overrides, GUI, CLI, API.
 2. **0.2:** applying recommendations (HA guests through `ha-manager`), Partially
    and Fully Automated levels, concurrency limits and cooldown, notifications,
-   rules mirrored into HA rules.
+   rules mirrored into HA rules (this release).
 3. **0.3:** maintenance mode, Power On (balanced) for initial placement,
    offline moves for stopped guests (this release; network-aware balancing and
    container moves came earlier).
