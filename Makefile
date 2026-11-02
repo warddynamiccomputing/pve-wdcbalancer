@@ -7,6 +7,7 @@ SBINDIR := $(DESTDIR)/usr/sbin
 LIBDIR := $(DESTDIR)/usr/share/$(PACKAGE)
 WWWDIR := $(DESTDIR)/usr/share/pve-manager/js
 UNITDIR := $(DESTDIR)/lib/systemd/system
+TEMPLATEDIR := $(DESTDIR)/usr/share/pve-manager/templates/default
 
 MODULES := $(wildcard src/PVE/WDCBalancer/*.pm)
 
@@ -24,6 +25,8 @@ install:
 	install -D -m 0644 www/wdcbalancer.js $(WWWDIR)/wdcbalancer.js
 	install -D -m 0644 systemd/wdcbalancer.service $(UNITDIR)/wdcbalancer.service
 	install -m 0644 systemd/wdcbalancer.timer $(UNITDIR)/
+	install -d $(TEMPLATEDIR)
+	install -m 0644 templates/wdcbalancer-alert-subject.txt.hbs templates/wdcbalancer-alert-body.txt.hbs $(TEMPLATEDIR)/
 
 # unit tests + compile check; runs anywhere with Perl (PVE modules are stubbed when absent)
 test:
