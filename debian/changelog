@@ -1,3 +1,27 @@
+pve-wdcbalancer (0.4.0) trixie; urgency=medium
+
+  * state.json is updated under the cluster lock by passes, apply tasks and
+    dismissals alike: Run now during an apply keeps the apply marker, and
+    moves and dismissals made while a pass runs are kept.
+  * Apply tasks write a heartbeat; a task whose node is offline, whose
+    process is gone or whose heartbeat stopped no longer blocks passes.
+  * Circuit breaker: automation pauses after repeated failed moves (fault,
+    notification); resume with the GUI or 'wdcbalancer resume'.
+  * Holds: nothing is recommended without quorum; only mandatory moves while
+    the online nodes settle after a change or usage data is missing.
+  * Each move is checked on live data first: quorum, target not in
+    maintenance mode, the guest's memory free on the target.
+  * Less churn: a fixed cost per migration, a higher cost for moving a guest
+    back where it came from, and a tolerated imbalance per threshold.
+  * One recommendation per guest and pass; keep-together fixes gather the
+    guests on the best node.
+  * Rule validation catches keep-together rules that, through a shared VM,
+    conflict with a separate rule.
+  * Fault notifications are keyed by fault, not message text; the history
+    has a size limit; config.json has a schema version.
+
+ -- pve-wdcbalancer maintainers <maintainers@example.invalid>  Mon, 02 Nov 2026 23:30:00 +0000
+
 pve-wdcbalancer (0.3.0) trixie; urgency=medium
 
   * Maintenance mode per node (Datacenter > Load Balancing > Maintenance,

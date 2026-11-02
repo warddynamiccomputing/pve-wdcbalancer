@@ -3,6 +3,41 @@
 The Debian changelog (`debian/changelog`) is the authoritative history; this is
 the readable summary.
 
+## 0.4.0
+Hardening before 1.0; no new settings.
+- **Safe concurrent writers.** Passes, apply tasks and dismissals update
+  `state.json` under the cluster lock without undoing each other: **Run now**
+  during an apply no longer hides the running task (which let a second apply
+  start), and moves or dismissals made while a pass runs are kept.
+- **Stale apply tasks.** An apply task writes a heartbeat; one whose node is
+  offline, whose process is gone or whose heartbeat stopped for 10 minutes
+  no longer blocks passes for up to four hours.
+- **Circuit breaker.** Automation pauses after 3 failed moves in a row or 5
+  within an hour, with a fault and a notification. **Resume automation** in
+  the Summary or `wdcbalancer resume`.
+- **Holds.** Without quorum nothing is recommended. For 10 minutes after the
+  online nodes change, and while usage data is missing, only mandatory moves
+  are recommended; a guest without usage data is never moved for balancing.
+- **Live checks before each move**: the cluster must be quorate, the target
+  not in maintenance mode and with the guest's memory free now.
+- **Less churn.** Every migration costs a fixed 3 points, moving a guest back
+  to the node it left within 4 hours costs 25 more, and each threshold
+  tolerates some imbalance (0.20 to 0.07) before evening out load noise.
+  In simulations with noisy load, thresholds 2 to 4 now make at most a move
+  or two in six hours of steady load (before: up to 35).
+- **One recommendation per guest and pass**: a guest that a later step would
+  move again gets a new target instead of a second migration. Keep-together
+  rule fixes gather the guests on the best node, not the one with most of
+  them, and rules that share a guest are fixed together.
+- Rule validation catches keep-together rules that, through a shared guest,
+  tie together guests a separate rule keeps apart.
+- Fault notifications are sent once per fault even when its details change.
+- The history file has a size limit; long messages are cut.
+- `config.json` has a schema version; a config from a newer release is
+  refused (and a node that can't read it leaves the timer lease to others).
+- Tests: properties over thousands of random clusters, multi-pass
+  simulations with noisy load, concurrency, breaker and holds.
+
 ## 0.3.0
 - **Maintenance mode** per node: Datacenter → Load Balancing → Maintenance,
   a **Load Balancing** panel in each node's menu, and `wdcbalancer

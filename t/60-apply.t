@@ -65,6 +65,9 @@ SKIP: {
     local *PVE::WDCBalancer::Apply::guest_lock = sub { return $lock{$_[0]}; };
     local *PVE::WDCBalancer::Apply::online_nodes = sub { return { a => 1, b => 1 } };
     local *PVE::WDCBalancer::Apply::task_status = sub { return { status => 'stopped', exitstatus => 'migration aborted' } };
+    local *PVE::WDCBalancer::Apply::quorate = sub { 1 };
+    local *PVE::WDCBalancer::Apply::maintenance_nodes = sub { {} };
+    local *PVE::WDCBalancer::Apply::node_memory = sub { { total => GiB(64), available => GiB(16) } };
     # the "migration": 'true' succeeds, and the guest arrives; 'false' fails
     local *PVE::WDCBalancer::Apply::command = sub {
         my ($r) = @_;
@@ -85,6 +88,31 @@ SKIP: {
     ok(!exists($r{101}->{pid}) && !exists($r{101}->{out}), 'no internals in results');
     ok((grep { /^OK +qemu 101: a -> b/ } @log), 'task log line for a move');
     is(scalar(@$res), 5, 'every recommendation has a result');
+}
+
+# ---------------- prechecks on live data ----------------
+{
+    no warnings qw(redefine once);
+    my ($quorate, %maint, $mem) = (1);
+    local *PVE::WDCBalancer::Apply::guest_location = sub { 'a' };
+    local *PVE::WDCBalancer::Apply::guest_lock = sub { undef };
+    local *PVE::WDCBalancer::Apply::quorate = sub { $quorate };
+    local *PVE::WDCBalancer::Apply::maintenance_nodes = sub { \%maint };
+    local *PVE::WDCBalancer::Apply::node_memory = sub { $mem };
+    my $pre = sub { $A->can('precheck')->({ %{ rec(101, 'a', 'b') }, mem => GiB(8), @_ }, { a => 1, b => 1 }) };
+    $mem = { total => GiB(64), available => GiB(16) };
+    is($pre->(), undef, 'precheck: all good');
+    $mem->{available} = GiB(4);
+    like($pre->(), qr/not enough free memory on b now \(8\.0 GiB needed, 4\.0 GiB free\)/, 'precheck: live memory on the target');
+    is($pre->(offline => 1), undef, 'precheck: an offline move needs no memory');
+    $mem = undef;
+    like($pre->(), qr/memory of b not available/, 'precheck: target status unreadable');
+    $mem = { total => GiB(64), available => GiB(16) };
+    %maint = (b => {});
+    like($pre->(), qr/b is in maintenance mode/, 'precheck: target went into maintenance mode');
+    %maint = ();
+    $quorate = 0;
+    like($pre->(), qr/not quorate/, 'precheck: no moves without quorum');
 }
 
 # ---------------- HA rule mirroring ----------------
@@ -152,6 +180,60 @@ EOF
         [ { type => 'rule', message => 'a' } ],
         [ { type => 'rule', message => 'a' }, { type => 'rule', message => 'b' }, { type => 'data', message => 'c' } ]);
     is_deeply([ map { $_->{message} } @$n ], ['b'], 'only new faults, data warnings excluded');
+    $n = PVE::WDCBalancer::Notify->can('new_faults')->(
+        [ { type => 'rule', rule => 'r', vmids => [101, 102], message => 'no node for 101 (last: not enough memory on n2)' },
+          { type => 'quorum', message => 'waiting 5 minute(s)' } ],
+        [ { type => 'rule', rule => 'r', vmids => [102, 101], message => 'no node for 101 (last: n3 is offline)' },
+          { type => 'quorum', message => 'waiting 4 minute(s)' },
+          { type => 'hold', message => 'Load balancing is on hold' } ]);
+    is_deeply($n, [], 'a fault that stays is not notified again when its details change; holds are quiet');
+}
+
+# ---------------- HA rule mirroring never touches rules it didn't make ----------------
+{
+    my $H = 'PVE::WDCBalancer::HARules';
+    my $MARK = $PVE::WDCBalancer::HARules::MARK;
+    srand(7);
+    my @bad;
+    for my $round (1 .. 500) {
+        my (%want, %have);
+        for my $i (1 .. 1 + int(rand(6))) {
+            my $id = "wdcb-r" . int(rand(8));
+            $want{$id} = { type => rand() < 0.5 ? 'node-affinity' : 'resource-affinity', resources => 'vm:' . (100 + int(rand(5))),
+                nodes => 'n' . int(rand(3)), affinity => rand() < 0.5 ? 'positive' : 'negative', strict => int(rand(2)) };
+        }
+        for my $i (1 .. int(rand(8))) {
+            # ours, hand-made with our prefix, hand-made with our comment, plain hand-made
+            my $kind = int(rand(4));
+            my $id = ($kind == 0 || $kind == 1 ? 'wdcb-r' : 'user-r') . int(rand(8));
+            $have{$id} = { type => rand() < 0.5 ? 'node-affinity' : 'resource-affinity', resources => 'vm:' . (100 + int(rand(5))),
+                affinity => 'positive', ($kind == 0 || $kind == 2) ? (comment => $MARK) : (comment => 'made by hand'),
+                rand() < 0.2 ? (disable => 1) : () };
+        }
+        my $ops = $H->can('plan')->(\%want, \%have);
+        my %created;
+        for my $op (@$ops) {
+            my ($what, $id) = @$op;
+            if ($what eq 'create') {
+                push @bad, "round $round: creates '$id', which exists and is not ours"
+                    if $have{$id} && !($have{$id}->{comment} eq $MARK && grep { $_->[0] eq 'delete' && $_->[1] eq $id } @$ops);
+                $created{$id} = 1;
+            } elsif ($what eq 'update' || $what eq 'delete') {
+                my $h = $have{$id};
+                push @bad, "round $round: $what of '$id', which doesn't exist" if !$h;
+                push @bad, "round $round: $what of '$id', which is not ours"
+                    if $h && (($h->{comment} // '') ne $MARK || index($id, 'wdcb-') != 0);
+            } elsif ($what eq 'conflict') {
+                push @bad, "round $round: conflict for '$id', which is ours" if ($have{$id}->{comment} // '') eq $MARK;
+            }
+        }
+        for my $id (keys %want) {
+            next if !$have{$id} || ($have{$id}->{comment} // '') ne $MARK;
+            push @bad, "round $round: '$id' is ours but neither kept, updated nor recreated"
+                if !grep { $_->[1] eq $id } @$ops and !$H->can('same')->($have{$id}, $want{$id});
+        }
+    }
+    is_deeply(\@bad, [], 'random HA rule sets: only rules with our prefix and comment are changed or deleted');
 }
 
 # ---------------- apply and the timer (state on a temp dir) ----------------
@@ -199,6 +281,7 @@ SKIP: {
     is_deeply(\@workers, ['wdcbapply'], 'in a wdcbapply task');
     $st = PVE::WDCBalancer::State::read_state();
     ok($st->{moved}->{$ran[0]}, 'moved guest starts its cooldown') if $ran[0] != 102;
+    is($st->{left}->{$ran[0]}->{node}, 'n1', 'and remembers where it came from') if $ran[0] != 102;
     ok(!$st->{applying}, 'apply marker cleared');
     my @moves = grep { $_->{type} eq 'move' } @{ PVE::WDCBalancer::State::history() };
     is(scalar(@moves), scalar(@ran), 'every move in the history');

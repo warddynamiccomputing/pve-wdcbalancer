@@ -12,7 +12,7 @@ know from DRS:
 It covers **every guest**, not only HA-managed ones. Proxmox's own CRS load
 balancer only acts on HA resources.
 
-> **Status: 0.3, release candidate for 1.0.** Everything on the roadmap is
+> **Status: 0.4, release candidate for 1.0.** Everything on the roadmap is
 > implemented and covered by automated tests, but it has not yet moved guests
 > on a real cluster with shared storage; 1.0 follows that test. Start with the
 > default manual level.
@@ -50,7 +50,7 @@ How it maps to vSphere and how the scores are computed:
 On every node of the cluster:
 
 ```bash
-apt install ./pve-wdcbalancer_0.3.0_all.deb
+apt install ./pve-wdcbalancer_0.4.0_all.deb
 ```
 
 The package:
@@ -95,9 +95,14 @@ wdcbalancer poweron 201,202        # Power On (balanced)
    and Fully Automated levels, concurrency limits and cooldown, notifications,
    rules mirrored into HA rules.
 3. **0.3:** maintenance mode, Power On (balanced) for initial placement,
-   offline moves for stopped guests (this release; network-aware balancing and
-   container moves came earlier).
-4. **1.0:** after a full test on a cluster with shared storage ([test plan](docs/wdcbalancer-Test-Plan.md)).
+   offline moves for stopped guests (network-aware balancing and container
+   moves came earlier).
+4. **0.4:** hardening (this release): safe concurrent passes and applies,
+   stale-task detection, a circuit breaker for automation, holds on lost
+   quorum, node changes and missing data, live checks before each move,
+   damping against load noise and back-and-forth moves, a config schema
+   version.
+5. **1.0:** after a full test on a cluster with shared storage ([test plan](docs/wdcbalancer-Test-Plan.md)).
 
 Storage DRS (datastore clusters) is part of
 [pve-fcsan](https://github.com/warddynamiccomputing/pve-fcsan).

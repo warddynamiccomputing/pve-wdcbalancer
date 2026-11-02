@@ -37,6 +37,7 @@ sub node {
         cpu_model => $o{cpu_model} // 'Test CPU',
         cpu_flags => $o{cpu_flags} // 'fpu sse sse2',
         bridges => { map { $_ => 1 } @{ $o{bridges} // ['vmbr0'] } },
+        samples => $o{samples} // 5,
     };
     for my $st (@{ $o{storages} // [qw(shared local)] }) {
         $self->{storages}->{$st}->{nodes}->{$name} = 1;
@@ -69,6 +70,7 @@ sub guest {
         devices => $o{devices} // [],
         bridges => $o{bridges} // ['vmbr0'],
         cpu_type => $o{cpu_type} // 'x86-64-v2-AES',
+        samples => $o{samples} // 5,
     };
     return $self;
 }

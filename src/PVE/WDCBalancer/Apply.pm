@@ -6,9 +6,11 @@ package PVE::WDCBalancer::Apply;
 # API (Apply) or by the timer (automation).
 #
 # Moves run in parallel up to max_concurrent per node (source and target
-# both count). Each move is checked again just before it starts: the guest
-# must still be on its source node, running and unlocked, and the target
-# online. A move is done when the guest's config is on the target node.
+# both count). Each move is checked again just before it starts, on live
+# data: the guest must still be on its source node and unlocked, the
+# cluster quorate, and the target online, not in maintenance mode and with
+# the guest's memory free (the pass already kept the headroom). A move is
+# done when the guest's config is on the target node.
 #
 # The pure part, plan(), decides the order and is tested on its own.
 
@@ -17,6 +19,7 @@ use warnings;
 
 use JSON::PP;
 use File::Temp;
+use List::Util qw(max);
 use POSIX ();
 use Time::HiRes;
 
@@ -104,7 +107,31 @@ sub command {
         '--target', $rec->{to}, @mode, '--output-format', 'json' ];
 }
 
-# Checks just before a move starts; returns an error or undef.
+sub quorate {
+    return eval { PVE::Cluster::check_cfs_quorum(1) } ? 1 : 0;
+}
+
+# nodes in maintenance mode now (the config may have changed since the pass)
+sub maintenance_nodes {
+    my $cfg = eval { PVE::WDCBalancer::Config::load() } // {};
+    return $cfg->{maintenance} // {};
+}
+
+# { total, available } bytes on a node now, or undef
+sub node_memory {
+    my ($node) = @_;
+    my $out = '';
+    eval {
+        PVE::Tools::run_command(['pvesh', 'get', "/nodes/$node/status", '--output-format', 'json'],
+            outfunc => sub { $out .= "$_[0]\n" }, errfunc => sub {}, timeout => 30);
+    };
+    my $m = (eval { $json->decode($out) } // {})->{memory} // return undef;
+    return undef if !$m->{total};
+    return { total => $m->{total}, available => $m->{available} // $m->{free} // 0 };
+}
+
+# Checks just before a move starts, on live data; returns an error or
+# undef. The pass planned on averages that may be minutes old.
 sub precheck {
     my ($rec, $online) = @_;
     my $at = guest_location($rec->{vmid});
@@ -113,6 +140,14 @@ sub precheck {
     return "$rec->{to} is not online" if !$online->{$rec->{to}};
     if (my $lock = guest_lock($rec->{vmid}, $rec->{from}, $rec->{type})) {
         return "guest is locked ($lock)";
+    }
+    return "the cluster is not quorate" if !quorate();
+    return "$rec->{to} is in maintenance mode" if maintenance_nodes()->{$rec->{to}};
+    # a running guest needs its memory on the target now
+    if (!$rec->{offline} && $rec->{mem}) {
+        my $m = node_memory($rec->{to}) // return "memory of $rec->{to} not available";
+        return sprintf("not enough free memory on %s now (%.1f GiB needed, %.1f GiB free)",
+            $rec->{to}, $rec->{mem} / 1024 ** 3, max(0, $m->{available}) / 1024 ** 3) if $rec->{mem} > $m->{available};
     }
     return undef;
 }

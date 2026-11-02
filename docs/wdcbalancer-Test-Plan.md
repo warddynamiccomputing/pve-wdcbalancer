@@ -71,6 +71,11 @@ Record for each check: date, result (pass / fail), and the task ID or
 6. Stop the leader node's timer (`systemctl stop wdcbalancer.timer`) → within
    about 3 minutes another node takes the lease and runs the passes. Start it
    again.
+7. Circuit breaker: make three automatic moves fail in a row (for example,
+   remove the target's migration network bridge or block the migration port
+   between two nodes while automation moves to them) → fault and error
+   notification "automation paused", no further automatic moves, recommendations
+   still shown. **Resume automation** in the Summary → automation resumes.
 
 ## 4. Rules
 
@@ -116,15 +121,27 @@ Record for each check: date, result (pass / fail), and the task ID or
 
 ## 7. Robustness
 
-1. A node goes offline during a pass → the pass reports it, no moves to it.
+1. A node goes offline during a pass → the pass reports it, no moves to it;
+   the next passes show the hold "the online nodes changed" and recommend
+   only mandatory moves for 10 minutes.
 2. A node goes offline during an apply → that move fails cleanly, the others
    finish.
-3. Upgrade `pve-manager` (or reinstall it) → `wdcbalancer-integrate status`
+3. Power off the node running an apply task (hard) → within 10 minutes the
+   Summary no longer shows the task as running, and the next pass runs.
+4. During a long apply, click **Run now** → the Summary still shows the apply
+   task; a second **Apply** is refused while it runs.
+5. Fill a target node's memory (a large VM or a memory hog) after a pass that
+   recommended a move there, then apply → the move is skipped with "not
+   enough free memory now".
+6. Cut quorum (stop corosync on enough nodes, in a maintenance window) →
+   fault "not quorate", no recommendations; recommendations come back after
+   quorum (and 10 minutes of settling).
+7. Upgrade `pve-manager` (or reinstall it) → `wdcbalancer-integrate status`
    still integrated (dpkg trigger), GUI and API work.
-4. Install and remove the package on one node → the Proxmox API and GUI
+8. Install and remove the package on one node → the Proxmox API and GUI
    keep working; `/etc/pve/wdcbalancer` stays.
-5. 24 hours with full automation and normal load → no ping-pong moves in the
-   history, no unexpected faults.
+9. 24 hours with full automation and normal load → no guest moved back to a node it left
+   within 4 hours, no unexpected faults.
 
 ## Result
 

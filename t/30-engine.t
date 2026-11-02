@@ -209,4 +209,85 @@ sub three_nodes {
 is($E->can('priority_for_gain')->(60), 2, 'priority 2 for big gains');
 is($E->can('priority_for_gain')->(1), undef, 'no recommendation for tiny gains');
 
+# ---------------- holds: quorum, settling, missing data ----------------
+{
+    my $contended = sub {
+        my $s = three_nodes();
+        $s->guest(100 + $_, 'n1', cpu => 3, mem => 4, @_) for 1 .. 6;
+        $s->guest(110, 'n2', cpu => 1, mem => 4);
+        return $s->snap;
+    };
+    my $base = $E->can('pass')->($contended->(), cfg());
+    ok(@{$base->{recommendations}} >= 1, 'contended cluster: balancing moves');
+    ok(!$base->{cluster}->{hold}, 'no hold');
+    is($base->{cluster}->{quorate}, 1, 'quorate when the snapshot does not say otherwise');
+    ok($base->{recommendations}->[0]->{mem} > 0, 'recommendations carry the memory the move needs');
+
+    my $snap = $contended->();
+    $snap->{quorate} = 0;
+    $snap->{nodes}->{n2}->{maintenance} = 1;
+    my $r = $E->can('pass')->($snap, cfg());
+    is_deeply(moves($r), [], 'no quorum: nothing at all, not even maintenance moves');
+    ok((grep { $_->{type} eq 'quorum' } @{$r->{faults}}), 'a quorum fault');
+    is($r->{cluster}->{expected}, $r->{cluster}->{score}, 'and no expected change');
+
+    $snap = $contended->();
+    $snap->{nodes}->{n2}->{maintenance} = 1;
+    $r = $E->can('pass')->($snap, cfg(), settling => 300);
+    is_deeply([ map { $_->{kind} } @{$r->{recommendations}} ], ['maintenance'], 'settling: only mandatory moves');
+    like($r->{cluster}->{hold}, qr/waiting 5 more minute/, 'with the time left');
+    ok((grep { $_->{type} eq 'hold' } @{$r->{faults}}), 'and a hold fault');
+
+    $snap = $contended->();
+    $snap->{nodes}->{n3}->{samples} = 0;
+    $r = $E->can('pass')->($snap, cfg());
+    is_deeply(moves($r), [], 'a node without recent data: no balancing');
+    like($r->{cluster}->{hold}, qr/no recent usage data for node\(s\) n3/, 'and why');
+    $snap->{nodes}->{n3}->{online} = 0;
+    $r = $E->can('pass')->($snap, cfg());
+    ok(!$r->{cluster}->{hold}, 'an offline node without data is no reason to hold');
+
+    $snap = $contended->();
+    $snap->{guests}->{$_}->{samples} = 0 for 101, 102;
+    $r = $E->can('pass')->($snap, cfg());
+    like($r->{cluster}->{hold}, qr/2 of 7 running guests have no recent usage data/, 'too many guests without data: hold');
+
+    $snap = $contended->();
+    $snap->{guests}->{101}->{samples} = 0;
+    $r = $E->can('pass')->($snap, cfg());
+    ok(!$r->{cluster}->{hold}, 'one guest without data: no hold');
+    ok(@{$r->{recommendations}}, 'the others are balanced');
+    ok(!grep({ $_->{vmid} == 101 } @{$r->{recommendations}}), 'but the guest without data is not moved');
+}
+
+# ---------------- move costs: fixed part, bouncing back, tolerated imbalance ----------------
+{
+    my $s = three_nodes();
+    $s->guest(100 + $_, 'n1', cpu => 3, mem => 4) for 1 .. 6;
+    my $now = 1_000_000;
+    my $r = $E->can('pass')->($s->snap, cfg(), now => $now);
+    my ($first) = @{$r->{recommendations}};
+    ok($first, 'a balancing move');
+    ok($E->can('move_cost')->($s->snap, {}, [ $first->{vmid} ]) >= $PVE::WDCBalancer::Engine::MOVE_COST,
+        'every migration costs at least the fixed part');
+    my $left = { $first->{vmid} => { node => $first->{to}, time => $now - 600 } };
+    my $r2 = $E->can('pass')->($s->snap, cfg(), now => $now, left => $left);
+    my ($same) = grep { $_->{vmid} == $first->{vmid} && $_->{to} eq $first->{to} } @{$r2->{recommendations}};
+    ok(!$same || $same->{gain} <= $first->{gain} - $PVE::WDCBalancer::Engine::BOUNCE_COST + 0.1,
+        'moving a guest back where it just came from costs more');
+    $left->{ $first->{vmid} }->{time} = $now - $PVE::WDCBalancer::Engine::BOUNCE_WINDOW;
+    my $r3 = $E->can('pass')->($s->snap, cfg(), now => $now, left => $left);
+    is_deeply(moves($r3), moves($r), 'not after the bounce window');
+
+    # every VM happy, imbalance within the threshold's tolerance: nothing to do
+    $s = three_nodes();
+    $s->guest(101, 'n1', cpu => 2, mem => 8);
+    $s->guest(102, 'n1', cpu => 1, mem => 8);
+    $s->guest(103, 'n2', cpu => 2, mem => 8);
+    $s->guest(104, 'n3', cpu => 1, mem => 8);
+    my $calm = $E->can('pass')->($s->snap, cfg(settings => { threshold => 5 }));
+    ok($calm->{cluster}->{imbalance} <= $PVE::WDCBalancer::Engine::TOLERANCE{5}, 'slightly uneven, within tolerance');
+    is_deeply(moves($calm), [], 'every VM happy within tolerance: no moves, even at threshold 5');
+}
+
 done_testing();

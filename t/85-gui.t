@@ -63,6 +63,8 @@ unlike($js, qr/['"]migrate['"]|\/migrate\b/, 'the GUI never migrates guests itse
 like($js, qr/Utils\.url\('apply'\)/, 'it uses the apply API');
 like($js, qr/Ext\.Msg\.confirm\(gettext\('Apply recommendations'\)/, 'applying asks first');
 like($js, qr/Proxmox\.window\.TaskViewer/, 'and shows the task');
+like($js, qr/Ext\.Msg\.confirm\(gettext\('Resume automation'\)/, 'resuming automation asks first');
+like($js, qr/setHidden\(!d\.breaker\)/, 'the resume button shows only while automation is paused');
 my ($ov) = class_body('PVE.wdcb.OverrideEdit') // '';
 like($ov, qr/\['disabled', 'manual', 'partial', 'full'\]/, 'overrides offer all four levels');
 

@@ -22,7 +22,7 @@ use PVE::WDCBalancer::State;
 
 use base qw(PVE::RESTHandler);
 
-our $VERSION = '0.3.0';
+our $VERSION = '0.4.0';
 
 my $PERM_AUDIT = ['perm', '/', ['Sys.Audit']];
 my $PERM_MODIFY = ['perm', '/', ['Sys.Modify']];
@@ -69,7 +69,7 @@ $register->({
     parameters => { additionalProperties => 0, properties => { node => $node_opt } },
     returns => { type => 'array', items => { type => 'object', properties => { name => { type => 'string' } } } },
     code => sub {
-        return [ map { { name => $_ } } qw(apply dismiss explain faults groups guests ha-sync history maintenance overrides placement poweron recommendations rules run settings status timer-run) ];
+        return [ map { { name => $_ } } qw(apply dismiss explain faults groups guests ha-sync history maintenance overrides placement poweron recommendations resume rules run settings status timer-run) ];
     },
 });
 
@@ -101,6 +101,7 @@ $register->({
             recommendations => scalar(@{$res->{recommendations} // []}),
             faults => scalar(@{$res->{faults} // []}),
             applying => PVE::WDCBalancer::State::apply_running($state) ? $state->{applying} : undef,
+            breaker => $state->{breaker},
         };
     },
 });
@@ -184,6 +185,7 @@ $register->({
         die "Proxmox CRS automatic rebalancing (ha-auto-rebalance) is on; turn it off first, two balancers would compete\n"
             if $state->{result}->{cluster}->{crs_conflict};
         die "another apply task is running\n" if PVE::WDCBalancer::State::apply_running($state);
+        die "the cluster is not quorate\n" if ($state->{result}->{cluster}->{quorate} // 1) == 0;
         my $recs = PVE::WDCBalancer::State::pick(defined($param->{ids}) ? $list->($param->{ids}) : undef);
         die "no recommendations to apply\n" if !@$recs;
         $rpcenv->check($user, "/vms/$_->{vmid}", ['VM.Migrate']) for @$recs;
@@ -353,6 +355,17 @@ $register->({
             faults => scalar(@{$res->{faults}}),
         };
     },
+});
+
+$register->({
+    name => 'resume',
+    path => 'resume',
+    method => 'POST',
+    description => "Resume automation after the circuit breaker paused it (too many failed moves).",
+    permissions => { check => $PERM_MODIFY },
+    parameters => { additionalProperties => 0, properties => { node => $node_opt } },
+    returns => { type => 'object', properties => { resumed => { type => 'boolean' } } },
+    code => sub { return { resumed => PVE::WDCBalancer::State::breaker_reset($user->()) ? 1 : 0 }; },
 });
 
 $register->({

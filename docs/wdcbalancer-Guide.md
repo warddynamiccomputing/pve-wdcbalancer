@@ -52,18 +52,39 @@ A pass:
       - guests on a node in maintenance;
       - violations of *must* VM/Host rules;
       - violations of *separate* rules (the guest with the most memory stays);
-      - violations of *together* rules (the guests join the node that already
-        has most of them).
+      - violations of *together* rules: the guests join the node where they
+        do best after the cost of the moves (soft rules first, then fewer
+        moves). Rules that share a guest are fixed as one group.
    2. **Soft rule fixes** (priority 2, threshold ≥ 2): violations of *should*
       VM/Host rules.
    3. **Balancing** (threshold ≥ 2): repeatedly the single move with the best
-      net gain, until no move reaches a priority within the threshold, or until
-      `max_moves`.
+      net gain, until no move reaches a priority within the threshold, until
+      `max_moves`, or until every VM is happy and the imbalance is within
+      the threshold's tolerance (see below).
 4. **Stores** the result in `/etc/pve/wdcbalancer/state.json`, and the pass in
    the history.
 
 Each recommendation assumes the earlier ones were applied. "After
 recommendations" in the GUI shows the cluster as it would be after all of them.
+A guest gets at most one recommendation per pass. When a later step would
+move it again (a maintenance evacuation, then its keep-together partner's
+rule; or a better target found while balancing), its recommendation gets
+the new target, or is dropped when the guest would end up where it is.
+
+### Holds
+
+A pass doesn't balance when its data or the cluster can't be trusted. Each
+hold is a fault, shown in the Summary:
+
+| Hold | What is still recommended |
+| --- | --- |
+| The cluster is not quorate | nothing |
+| The online nodes changed in the last 10 minutes (a node went down or came back; HA may be recovering guests) | mandatory moves |
+| An online node has no usage samples in the interval | mandatory moves |
+| More than a quarter of the running guests have no usage samples | mandatory moves |
+
+A guest without usage samples (just started, or its RRD data is missing) is
+never moved for balancing.
 
 ## Demand and scores
 
@@ -105,10 +126,13 @@ The spread is half the sum of the squared deviations of node utilization from
 the cluster mean, weighted so that evening out a tenth of a node's capacity
 between a busy and an idle node is worth about 10 points.
 
-The **gain** of a move is its change in the objective, minus its cost: 2 points
-per minute of migration at `migration_speed`. A move that relieves a contended
-node counts for every guest on that node, so gains don't shrink as the cluster
-grows.
+The **gain** of a move is its change in the objective, minus its **cost**:
+3 points per migration (the stun at switch-over, the migration network, the
+risk of a failure) plus 2 points per minute of migration at
+`migration_speed`. Moving a guest back to the node it left less than 4 hours
+ago costs 25 points more: going back and forth is churn unless the load
+really changed. A move that relieves a contended node counts for every guest
+on that node, so gains don't shrink as the cluster grows.
 
 | Gain (points) | Priority |
 | --- | --- |
@@ -118,9 +142,21 @@ grows.
 | ≥ 8 | 4 |
 | ≥ 2 | 5 |
 
+**Tolerated imbalance** (vSphere: the target imbalance). Load noise makes
+small moves look worthwhile, so each threshold tolerates some imbalance.
+Within it, balancing stops when every VM scores at least 95, and otherwise
+only makes priority 2 moves (clear contention):
+
+| Threshold | 2 | 3 | 4 | 5 |
+| --- | --- | --- | --- | --- |
+| Tolerated imbalance | 0.20 | 0.15 | 0.10 | 0.07 |
+
 With the default threshold 3, moves that clearly improve VM scores are
 recommended. A cluster where every guest is happy is left alone even if some
 nodes are busier than others; that is what threshold 4 and 5 are for.
+Threshold 5 acts on small gains: on a busy cluster with noisy load it can
+move a guest every pass or two (never straight back); 3 is the right level
+for most clusters.
 
 A guest moved within `cooldown` (30 minutes) is not moved again for balancing.
 A dismissed recommendation isn't made again for an hour.
@@ -175,9 +211,10 @@ a **fault**.
 
 - Moves run in the order of the pass, up to `max_concurrent` at a time per
   node (the source and the target both count), one move per guest at a time.
-- Just before a move starts, the guest is checked again. It must still be on
-  its source node and unlocked, and the target must be online. If not, the
-  move is skipped and the reason logged.
+- Just before a move starts, it is checked again on live data: the guest
+  must still be on its source node and unlocked, the cluster quorate, and
+  the target online, not in maintenance mode and with the guest's memory
+  free now. If not, the move is skipped and the reason logged.
 - **VMs** are live-migrated. **Containers** are migrated in restart mode,
   so they restart on the new node. **HA guests** are moved with
   `ha-manager crm-command migrate`, so HA doesn't move them back.
@@ -187,7 +224,10 @@ a **fault**.
 - Moved guests start their cooldown, and every move is in the history with
   its result and duration.
 
-Only one apply task runs at a time. Applying needs `Sys.Modify` on `/` and
+Only one apply task runs at a time. A running task writes a heartbeat
+every minute; a task whose node went offline, whose process is gone or
+whose heartbeat stopped for 10 minutes no longer blocks passes and new
+tasks. Applying needs `Sys.Modify` on `/` and
 `VM.Migrate` on every guest that is moved. Nothing is moved while Proxmox CRS
 auto-rebalancing is on.
 
@@ -207,6 +247,13 @@ Per-VM overrides take precedence:
 With full automation, containers are moved only when `containers` is
 `restart`. Otherwise they stay as recommendations, because moving them
 restarts them.
+
+**Circuit breaker.** When 3 moves in a row fail, or 5 within an hour,
+automation pauses: a fault and a notification say why, passes still
+recommend, and you can still apply by hand. Moves skipped by the check just
+before they start (the guest moved meanwhile, a node in maintenance) don't
+count. Fix the cause, then **Resume automation** (Summary) or
+`wdcbalancer resume`.
 
 ## Maintenance mode
 
@@ -278,9 +325,12 @@ ha-sync` syncs them at once.
 
 With `notify` on (the default), these go through the Proxmox VE notification
 system (**Datacenter → Notifications**; metadata `type=wdcbalancer`):
-- new faults, once per fault;
+- new faults, once per fault (a fault that stays with changing details, such
+  as minutes left or sizes, isn't sent again; missing data and balancing
+  holds are not sent);
 - automatic moves (info, or warning if one failed);
-- failed moves applied by hand.
+- failed moves applied by hand;
+- the circuit breaker pausing automation (error).
 
 The templates are `/usr/share/pve-manager/templates/default/wdcbalancer-alert-*.txt.hbs`.
 
@@ -328,6 +378,7 @@ the configuration and the last pass are cluster-wide.
 | `poweron` | POST `vmids`, `target` | Power On (balanced) (a task); needs `VM.PowerMgmt` and `VM.Migrate` on each guest |
 | `dismiss` | POST `id` | |
 | `run` | POST | Run DRS now |
+| `resume` | POST | resume automation after the circuit breaker paused it |
 | `guests` | GET | VM scores and movability |
 | `faults`, `history` | GET | |
 | `explain` | GET `vmid` | placement per node |
@@ -337,6 +388,14 @@ the configuration and the last pass are cluster-wide.
 | `overrides`, `overrides/{vmid}` | GET, PUT, DELETE | |
 
 Viewing needs `Sys.Audit` on `/`; changes need `Sys.Modify` on `/`.
+
+## Upgrades
+
+`config.json` carries a schema version. A newer release upgrades an older
+config when it reads it (and writes it back upgraded on the next change). A
+config written by a newer release is refused: during a rolling upgrade the
+nodes not yet upgraded stop running passes and leave the lease to the
+upgraded ones, instead of rewriting a format they don't know.
 
 ## Uninstall
 
