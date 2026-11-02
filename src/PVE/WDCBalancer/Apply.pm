@@ -96,12 +96,12 @@ sub ha_sid {
 sub command {
     my ($rec) = @_;
     return [ 'ha-manager', 'crm-command', 'migrate', ha_sid($rec), $rec->{to} ] if $rec->{ha};
-    if ($rec->{type} eq 'lxc') {
-        return [ 'pvesh', 'create', "/nodes/$rec->{from}/lxc/$rec->{vmid}/migrate",
-            '--target', $rec->{to}, '--restart', '1', '--output-format', 'json' ];
-    }
-    return [ 'pvesh', 'create', "/nodes/$rec->{from}/qemu/$rec->{vmid}/migrate",
-        '--target', $rec->{to}, '--online', '1', '--output-format', 'json' ];
+    # 'offline': a stopped guest (maintenance, power-on); only its config moves
+    # when its disks are on shared storage
+    my @mode = $rec->{offline} ? () : $rec->{type} eq 'lxc' ? ('--restart', '1') : ('--online', '1');
+    my $kind = $rec->{type} eq 'lxc' ? 'lxc' : 'qemu';
+    return [ 'pvesh', 'create', "/nodes/$rec->{from}/$kind/$rec->{vmid}/migrate",
+        '--target', $rec->{to}, @mode, '--output-format', 'json' ];
 }
 
 # Checks just before a move starts; returns an error or undef.

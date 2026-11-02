@@ -17,11 +17,12 @@ use PVE::WDCBalancer::Collect;
 use PVE::WDCBalancer::Config;
 use PVE::WDCBalancer::Engine;
 use PVE::WDCBalancer::HARules;
+use PVE::WDCBalancer::Operations;
 use PVE::WDCBalancer::State;
 
 use base qw(PVE::RESTHandler);
 
-our $VERSION = '0.2.0';
+our $VERSION = '0.3.0';
 
 my $PERM_AUDIT = ['perm', '/', ['Sys.Audit']];
 my $PERM_MODIFY = ['perm', '/', ['Sys.Modify']];
@@ -68,7 +69,7 @@ $register->({
     parameters => { additionalProperties => 0, properties => { node => $node_opt } },
     returns => { type => 'array', items => { type => 'object', properties => { name => { type => 'string' } } } },
     code => sub {
-        return [ map { { name => $_ } } qw(apply dismiss explain faults groups guests ha-sync history overrides recommendations rules run settings status timer-run) ];
+        return [ map { { name => $_ } } qw(apply dismiss explain faults groups guests ha-sync history maintenance overrides placement poweron recommendations rules run settings status timer-run) ];
     },
 });
 
@@ -188,6 +189,136 @@ $register->({
         $rpcenv->check($user, "/vms/$_->{vmid}", ['VM.Migrate']) for @$recs;
         return $rpcenv->fork_worker('wdcbapply', undef, $user, sub {
             PVE::WDCBalancer::State::apply($recs, trigger => $user);
+        });
+    },
+});
+
+# ---------------- maintenance mode ----------------
+
+my $host_opt = { %{ get_standard_option('pve-node') }, description => 'The node to put into or take out of maintenance mode.' };
+
+$register->({
+    name => 'maintenance',
+    path => 'maintenance',
+    method => 'GET',
+    description => "Maintenance mode of every node, with the guests that keep a node from being empty.",
+    permissions => { check => $PERM_AUDIT },
+    parameters => { additionalProperties => 0, properties => { node => $node_opt } },
+    returns => { type => 'array', items => { type => 'object' } },
+    code => sub {
+        my $state = PVE::WDCBalancer::State::read_state();
+        my $cfg = PVE::WDCBalancer::Config::load();
+        my $guests = $state->{result}->{guests} // {};
+        my @res;
+        for my $n (sort keys %{$state->{result}->{nodes} // {}}) {
+            my $m = $cfg->{maintenance}->{$n};
+            my @running = grep { ($_->{node} // '') eq $n && ($_->{status} // '') eq 'running' } values %$guests;
+            push @res, {
+                node => $n,
+                maintenance => $m ? 1 : 0,
+                $m ? (since => $m->{since}, user => $m->{user}) : (),
+                running => scalar(@running),
+                blocked => join(', ', map { "$_->{vmid}" . ($_->{reason} ? " ($_->{reason})" : '') }
+                    sort { $a->{vmid} <=> $b->{vmid} } grep { !$_->{movable} } @running),
+                state => !$m ? 'online' : @running ? 'entering maintenance' : 'in maintenance',
+            };
+        }
+        return \@res;
+    },
+});
+
+$register->({
+    name => 'maintenance_enter',
+    path => 'maintenance/{host}/enter',
+    method => 'POST',
+    description => "Enter maintenance mode (in a task): move the running guests off the node (HA guests through"
+        . " HA node maintenance), optionally the stopped ones too.",
+    permissions => {
+        description => "Sys.Modify on / and VM.Migrate on /vms.",
+        check => ['and', $PERM_MODIFY, ['perm', '/vms', ['VM.Migrate']]],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => $node_opt,
+            host => $host_opt,
+            'move-stopped' => { type => 'boolean', optional => 1, default => 0,
+                description => 'Also move powered-off guests (offline; on shared storage only their config moves).' },
+        },
+    },
+    returns => { type => 'string', description => 'Task ID.' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $user = $rpcenv->get_user();
+        return $rpcenv->fork_worker('wdcbmaint', $param->{host}, $user, sub {
+            PVE::WDCBalancer::Operations::enter_maintenance($param->{host}, user => $user,
+                move_stopped => $param->{'move-stopped'});
+        });
+    },
+});
+
+$register->({
+    name => 'maintenance_exit',
+    path => 'maintenance/{host}/exit',
+    method => 'POST',
+    description => "Exit maintenance mode.",
+    permissions => { check => $PERM_MODIFY },
+    parameters => { additionalProperties => 0, properties => { node => $node_opt, host => $host_opt } },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+        PVE::WDCBalancer::Operations::exit_maintenance($param->{host}, user => $user->());
+        return undef;
+    },
+});
+
+# ---------------- initial placement ----------------
+
+my $vmids_opt = { type => 'string', format => 'pve-vmid-list', description => 'Guest IDs, comma separated.' };
+
+$register->({
+    name => 'placement',
+    path => 'placement',
+    method => 'GET',
+    description => "Where stopped guests would be started (initial placement), without doing anything.",
+    permissions => { check => $PERM_AUDIT },
+    parameters => { additionalProperties => 0, properties => { node => $node_opt, vmids => $vmids_opt } },
+    returns => { type => 'array', items => { type => 'object' } },
+    code => sub {
+        my ($param) = @_;
+        return PVE::WDCBalancer::Operations::placement($list->($param->{vmids}));
+    },
+});
+
+$register->({
+    name => 'poweron',
+    path => 'poweron',
+    method => 'POST',
+    description => "Power On (balanced): start stopped guests on the best node, moving them there offline first."
+        . " HA guests are started through HA.",
+    permissions => {
+        description => "VM.PowerMgmt and VM.Migrate on every guest.",
+        user => 'all',
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => $node_opt,
+            vmids => $vmids_opt,
+            target => { %{ get_standard_option('pve-node') }, optional => 1,
+                description => 'Start the (single) guest on this node instead of the recommended one.' },
+        },
+    },
+    returns => { type => 'string', description => 'Task ID.' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $u = $rpcenv->get_user();
+        my $ids = $list->($param->{vmids});
+        $rpcenv->check($u, "/vms/$_", ['VM.PowerMgmt', 'VM.Migrate']) for @$ids;
+        return $rpcenv->fork_worker('wdcbpoweron', undef, $u, sub {
+            PVE::WDCBalancer::Operations::power_on($ids, user => $u, target => $param->{target});
         });
     },
 });

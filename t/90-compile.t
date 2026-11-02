@@ -17,6 +17,7 @@ my @modules = qw(
     PVE::WDCBalancer::Apply
     PVE::WDCBalancer::HARules
     PVE::WDCBalancer::Notify
+    PVE::WDCBalancer::Operations
     PVE::API2::WDCBalancer
     PVE::CLI::wdcbalancer
 );

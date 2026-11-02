@@ -3,6 +3,17 @@
 The Debian changelog (`debian/changelog`) is the authoritative history; this is
 the readable summary.
 
+## 0.3.0
+- **Maintenance mode** per node: Datacenter → Load Balancing → Maintenance,
+  a **Load Balancing** panel in each node's menu, and `wdcbalancer
+  maintenance`. Running guests are moved off at once (HA guests through HA
+  node maintenance), optionally the stopped ones too; guests that can't move
+  are listed. Nothing is placed on a node in maintenance.
+- **Power On (balanced)**: stopped guests start on the best node and are
+  moved there offline first. With manual automation you see the ranking of
+  nodes and pick. `wdcbalancer placement` and `wdcbalancer poweron`.
+- Stopped guests are moved offline (on shared storage only their config moves).
+
 ## 0.2.0
 - Recommendations can be applied: **Apply**, **Apply all**, `wdcbalancer apply`.
   VMs are live-migrated, containers migrated with a restart, HA guests moved

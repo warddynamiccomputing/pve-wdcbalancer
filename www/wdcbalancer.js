@@ -8,6 +8,8 @@
 
 Proxmox.Utils.override_task_descriptions({
     wdcbapply: ['Load Balancing', gettext('Apply recommendations')],
+    wdcbmaint: ['Node', gettext('Enter maintenance mode')],
+    wdcbpoweron: ['Load Balancing', gettext('Power On (balanced)')],
 });
 
 Ext.define('PVE.wdcb.Utils', {
@@ -90,6 +92,69 @@ Ext.define('PVE.wdcb.Utils', {
 	Proxmox.Utils.API2Request(Ext.apply({
 	    failure: response => Ext.Msg.alert(gettext('Error'), response.htmlStatus),
 	}, opts));
+    },
+
+    // POST that starts a task, then show the task
+    task: function(path, params, panel) {
+	PVE.wdcb.Utils.request({
+	    url: PVE.wdcb.Utils.url(path),
+	    method: 'POST',
+	    params: params || {},
+	    waitMsgTarget: panel,
+	    success: function(response) {
+		let win = Ext.create('Proxmox.window.TaskViewer', { upid: response.result.data });
+		win.on('destroy', () => panel.reload && panel.reload());
+		win.show();
+	    },
+	});
+    },
+
+    enterMaintenance: function(node, panel) {
+	Ext.create('Ext.window.Window', {
+	    title: Ext.String.format(gettext('Enter maintenance mode: {0}'), node),
+	    modal: true,
+	    width: 480,
+	    bodyPadding: 10,
+	    layout: 'anchor',
+	    items: [
+		{ xtype: 'displayfield', value: gettext('Running guests are moved to other nodes now (HA guests through HA node maintenance). Nothing is placed on this node until it leaves maintenance mode.') },
+		{ xtype: 'checkbox', itemId: 'stopped', boxLabel: gettext('Also move powered-off guests') },
+	    ],
+	    buttons: [{
+		text: gettext('Enter maintenance mode'),
+		handler: function() {
+		    let win = this.up('window');
+		    let stopped = win.down('#stopped').getValue();
+		    win.close();
+		    PVE.wdcb.Utils.task(`maintenance/${encodeURIComponent(node)}/enter`, stopped ? { 'move-stopped': 1 } : {}, panel);
+		},
+	    }],
+	}).show();
+    },
+
+    exitMaintenance: function(node, panel) {
+	PVE.wdcb.Utils.request({
+	    url: PVE.wdcb.Utils.url(`maintenance/${encodeURIComponent(node)}/exit`),
+	    method: 'POST',
+	    waitMsgTarget: panel,
+	    success: () => panel.reload(),
+	});
+    },
+
+    // Power On (balanced): with manual automation, show where and let the user pick
+    powerOn: function(vmids, panel) {
+	PVE.wdcb.Utils.request({
+	    url: PVE.wdcb.Utils.url('settings'),
+	    method: 'GET',
+	    success: function(response) {
+		let manual = response.result.data.automation === 'manual';
+		if (manual && vmids.length === 1) {
+		    Ext.create('PVE.wdcb.PlacementWindow', { vmid: vmids[0], panel }).show();
+		} else {
+		    PVE.wdcb.Utils.task('poweron', { vmids: vmids.join(',') }, panel);
+		}
+	    },
+	});
     },
 
     // apply recommendations (all when ids is undefined) and follow the task
@@ -303,6 +368,161 @@ Ext.define('PVE.wdcb.ExplainWindow', {
     },
 });
 
+Ext.define('PVE.wdcb.PlacementWindow', {
+    extend: 'Ext.window.Window',
+
+    width: 700,
+    height: 340,
+    modal: true,
+    layout: 'fit',
+
+    initComponent: function() {
+	let me = this;
+	me.title = Ext.String.format(gettext('Power On (balanced): guest {0}'), me.vmid);
+	let store = Ext.create('Ext.data.Store', { sorters: [{ property: 'ok', direction: 'DESC' }, { property: 'score', direction: 'DESC' }] });
+	me.items = [{
+	    xtype: 'grid',
+	    store,
+	    columns: PVE.wdcb.Utils.safeColumns([
+		{ header: gettext('Node'), dataIndex: 'node', width: 140,
+		    renderer: (v, m, rec) => Ext.htmlEncode(v + (v === me.recommended ? ` (${gettext('recommended')})` : '')) },
+		{ header: gettext('Allowed'), dataIndex: 'ok', width: 70, renderer: v => Ext.htmlEncode(Proxmox.Utils.format_boolean(v)) },
+		{ header: gettext('VM score there'), dataIndex: 'score', width: 110, renderer: PVE.wdcb.Utils.renderScore },
+		{ header: gettext('Why not'), dataIndex: 'reason', flex: 1 },
+	    ]),
+	}];
+	me.buttons = [{
+	    text: gettext('Power on here'),
+	    handler: function() {
+		let sel = me.down('grid').getSelection()[0];
+		let node = sel ? sel.data.node : me.recommended;
+		if (!node || (sel && !sel.data.ok)) {
+		    return;
+		}
+		me.close();
+		PVE.wdcb.Utils.task('poweron', { vmids: String(me.vmid), target: node }, me.panel);
+	    },
+	}];
+	me.callParent();
+	PVE.wdcb.Utils.request({
+	    url: PVE.wdcb.Utils.url('placement'),
+	    method: 'GET',
+	    params: { vmids: String(me.vmid) },
+	    waitMsgTarget: me,
+	    success: function(response) {
+		let p = (response.result.data || [])[0] || {};
+		me.recommended = p.to;
+		store.setData(p.ranking || []);
+		let rec = store.findRecord('node', p.to, 0, false, true, true);
+		if (rec) {
+		    me.down('grid').getSelectionModel().select(rec);
+		}
+	    },
+	});
+    },
+});
+
+Ext.define('PVE.wdcb.MaintenanceGrid', {
+    extend: 'PVE.wdcb.BaseGrid',
+    alias: 'widget.pveWdcbMaintenanceGrid',
+
+    title: gettext('Maintenance'),
+    wdcbPath: 'maintenance',
+    stateId: 'grid-wdcb-maintenance',
+
+    columns: PVE.wdcb.Utils.safeColumns([
+	{ header: gettext('Node'), dataIndex: 'node', width: 140 },
+	{ header: gettext('State'), dataIndex: 'state', width: 160 },
+	{ header: gettext('Since'), dataIndex: 'since', width: 160, renderer: PVE.wdcb.Utils.renderTime },
+	{ header: gettext('By'), dataIndex: 'user', width: 120 },
+	{ header: gettext('Running guests'), dataIndex: 'running', width: 110 },
+	{ header: gettext("Can't be moved"), dataIndex: 'blocked', flex: 1 },
+    ]),
+
+    initComponent: function() {
+	let me = this;
+	me.tbar = [
+	    {
+		xtype: 'proxmoxButton',
+		text: gettext('Enter maintenance mode'),
+		disabled: true,
+		enableFn: rec => !rec.data.maintenance,
+		handler: () => PVE.wdcb.Utils.enterMaintenance(me.selected().data.node, me),
+	    },
+	    {
+		xtype: 'proxmoxButton',
+		text: gettext('Exit maintenance mode'),
+		disabled: true,
+		enableFn: rec => !!rec.data.maintenance,
+		handler: () => PVE.wdcb.Utils.exitMaintenance(me.selected().data.node, me),
+	    },
+	];
+	me.callParent();
+    },
+});
+
+// Node > Load Balancing: this node's state and guests, maintenance mode
+Ext.define('PVE.wdcb.NodePanel', {
+    extend: 'Ext.panel.Panel',
+    alias: 'widget.pveWdcbNodePanel',
+
+    layout: { type: 'vbox', align: 'stretch' },
+
+    initComponent: function() {
+	let me = this;
+	if (!me.nodename) {
+	    throw "no node name specified";
+	}
+	me.guestStore = Ext.create('Ext.data.Store', { sorters: 'vmid' });
+	me.tbar = [
+	    { text: gettext('Enter maintenance mode'), itemId: 'enter', handler: () => PVE.wdcb.Utils.enterMaintenance(me.nodename, me) },
+	    { text: gettext('Exit maintenance mode'), itemId: 'exit', handler: () => PVE.wdcb.Utils.exitMaintenance(me.nodename, me) },
+	    '->',
+	    { text: gettext('Reload'), iconCls: 'fa fa-refresh', handler: () => me.reload() },
+	];
+	me.items = [
+	    { xtype: 'component', itemId: 'info', padding: 10 },
+	    {
+		xtype: 'grid',
+		flex: 1,
+		store: me.guestStore,
+		columns: PVE.wdcb.Utils.safeColumns([
+		    { header: 'ID', dataIndex: 'vmid', width: 70 },
+		    { header: gettext('Name'), dataIndex: 'name', flex: 1 },
+		    { header: gettext('Status'), dataIndex: 'status', width: 80 },
+		    { header: gettext('VM score'), dataIndex: 'score', width: 80, renderer: PVE.wdcb.Utils.renderScore },
+		    { header: gettext('Automation'), dataIndex: 'automation', width: 110, renderer: PVE.wdcb.Utils.renderAutomation },
+		    { header: gettext('Can be moved'), dataIndex: 'movable', width: 100, renderer: v => Ext.htmlEncode(Proxmox.Utils.format_boolean(v)) },
+		    { header: gettext('Why not'), dataIndex: 'reason', flex: 2 },
+		]),
+	    },
+	];
+	me.callParent();
+	me.on('activate', () => me.reload());
+    },
+
+    reload: function() {
+	let me = this;
+	PVE.wdcb.Utils.request({
+	    url: PVE.wdcb.Utils.url('maintenance'),
+	    method: 'GET',
+	    success: function(response) {
+		let m = (response.result.data || []).find(x => x.node === me.nodename) || { state: 'online' };
+		me.down('#enter').setDisabled(!!m.maintenance);
+		me.down('#exit').setDisabled(!m.maintenance);
+		me.down('#info').update(Ext.htmlEncode(`${gettext('State')}: ${m.state}`
+		    + (m.maintenance ? `, ${gettext('since')} ${Proxmox.Utils.render_timestamp(m.since)} (${m.user})` : '')
+		    + (m.blocked ? `. ${gettext("Can't be moved")}: ${m.blocked}` : '')));
+	    },
+	});
+	PVE.wdcb.Utils.request({
+	    url: PVE.wdcb.Utils.url('guests'),
+	    method: 'GET',
+	    success: response => me.guestStore.setData((response.result.data || []).filter(g => g.node === me.nodename)),
+	});
+    },
+});
+
 Ext.define('PVE.wdcb.RecGrid', {
     extend: 'PVE.wdcb.BaseGrid',
     alias: 'widget.pveWdcbRecGrid',
@@ -418,6 +638,7 @@ Ext.define('PVE.wdcb.GuestGrid', {
     wdcbPath: 'guests',
     stateId: 'grid-wdcb-guests',
     wdcbSorters: 'vmid',
+    selModel: { selType: 'rowmodel', mode: 'MULTI' },
 
     columns: PVE.wdcb.Utils.safeColumns([
 	{ header: 'ID', dataIndex: 'vmid', width: 70 },
@@ -443,6 +664,14 @@ Ext.define('PVE.wdcb.GuestGrid', {
 		text: gettext('Placement'),
 		disabled: true,
 		handler: () => Ext.create('PVE.wdcb.ExplainWindow', { vmid: me.selected().data.vmid }).show(),
+	    },
+	    {
+		xtype: 'proxmoxButton',
+		text: gettext('Power On (balanced)'),
+		iconCls: 'fa fa-play',
+		disabled: true,
+		enableFn: rec => rec.data.status === 'stopped',
+		handler: () => PVE.wdcb.Utils.powerOn(me.getSelection().filter(r => r.data.status === 'stopped').map(r => r.data.vmid), me),
 	    },
 	    {
 		xtype: 'proxmoxButton',
@@ -909,6 +1138,7 @@ Ext.define('PVE.wdcb.DcPanel', {
 	{ xtype: 'pveWdcbGroupGrid' },
 	{ xtype: 'pveWdcbRuleGrid' },
 	{ xtype: 'pveWdcbOverrideGrid' },
+	{ xtype: 'pveWdcbMaintenanceGrid' },
     ],
 });
 
@@ -939,6 +1169,20 @@ Ext.define('PVE.wdcb.ConfigHook', {
 		    } else {
 			me.items.push(entry);
 		    }
+		}
+	    }
+	    if (me.$className === 'PVE.node.Config' && Ext.isArray(me.items) &&
+		Ext.ClassManager.getByAlias('widget.pveWdcbNodePanel')) {
+		// Node > Load Balancing (state, guests, maintenance mode)
+		let caps = Ext.state.Manager.get('GuiCap');
+		if (caps && caps.nodes['Sys.Audit']) {
+		    me.items.push({
+			xtype: 'pveWdcbNodePanel',
+			title: gettext('Load Balancing'),
+			itemId: 'wdcbalancer',
+			iconCls: 'fa fa-balance-scale',
+			nodename: me.pveSelNode.data.node,
+		    });
 		}
 	    }
 	} catch (err) {
