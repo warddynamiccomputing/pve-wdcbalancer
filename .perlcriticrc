@@ -1,0 +1,12 @@
+# make lint: perlcritic over src/ and bin/
+severity = 5
+verbose  = %f:%l:%c: %m (%p)\n
+
+# Deliberate, matching Proxmox's own code:
+# "return undef" -- these subs are called in scalar context, where a bare
+# return would hand list callers an empty list instead of one undef
+[-Subroutines::ProhibitExplicitReturnUndef]
+# file modes are written as octal literals (0600)
+[-ValuesAndExpressions::ProhibitLeadingZeros]
+# select(undef, undef, undef, $secs) for sub-second sleeps without Time::HiRes
+[-BuiltinFunctions::ProhibitSleepViaSelect]

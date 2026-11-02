@@ -1,0 +1,156 @@
+#!/usr/bin/perl
+
+# Hook pve-wdcbalancer into pve-manager:
+#  - register PVE::API2::WDCBalancer as /nodes/{node}/wdcbalancer in PVE/API2/Nodes.pm
+#  - load wdcbalancer.js in the web GUI's index.html.tpl
+#
+# pve-manager has no plugin hooks for either, so both files get one marked
+# line each. A dpkg trigger re-runs 'apply' whenever pve-manager replaces
+# them, and 'apply' replaces a marked line from an older pve-wdcbalancer.
+#
+# The API line loads PVE::API2::WDCBalancer inside an eval: if
+# pve-wdcbalancer ever fails to load, only /nodes/{node}/wdcbalancer is
+# missing (with a warning in the pveproxy/pvedaemon journal); the rest of the
+# API keeps working. The edited Nodes.pm is compile-checked and rolled back
+# if it does not compile.
+#
+# Other packages (pve-fcsan) put their marked line at the same place; ours
+# goes after theirs, so neither package moves the other's line on re-apply.
+#
+# usage: wdcbalancer-integrate apply|remove|status
+#
+# WDCBALANCER_INTEGRATE_ROOT prefixes both paths (used by the tests).
+
+use strict;
+use warnings;
+
+use File::Copy qw(copy);
+
+my $ROOT = $ENV{WDCBALANCER_INTEGRATE_ROOT} // '';
+my $NODES_PM = "$ROOT/usr/share/perl5/PVE/API2/Nodes.pm";
+my $INDEX_TPL = "$ROOT/usr/share/pve-manager/index.html.tpl";
+my $MARK = 'wdcbalancer-integration';
+
+my $API_LINE = 'eval { require PVE::API2::WDCBalancer; __PACKAGE__->register_method({ subclass => "PVE::API2::WDCBalancer", path => \'wdcbalancer\' }); 1 }'
+    . ' or warn "pve-wdcbalancer: load balancing API disabled - $@";'
+    . " # $MARK\n";
+my $JS_LINE = "    <script type=\"text/javascript\" src=\"/pve2/js/wdcbalancer.js?ver=[% version %]\"></script> <!-- $MARK -->\n";
+
+sub slurp {
+    my ($file) = @_;
+    open(my $fh, '<', $file) or die "unable to read $file - $!\n";
+    local $/;
+    my $c = <$fh>;
+    close($fh);
+    return $c;
+}
+
+sub spew {
+    my ($file, $content) = @_;
+    my $tmp = "$file.wdcbalancer-tmp";
+    open(my $fh, '>', $tmp) or die "unable to write $tmp - $!\n";
+    print $fh $content;
+    close($fh) or die "unable to write $tmp - $!\n";
+    my @st = stat($file);
+    chmod($st[2] & 07777, $tmp) if @st;
+    rename($tmp, $file) or die "rename $tmp failed - $!\n";
+}
+
+sub strip_marked {
+    my ($content) = @_;
+    return join('', grep { !/\Q$MARK\E/ } split(/^/, $content));
+}
+
+# Returns the new content and how it differs from $orig ("integrated",
+# "updated" for a line from an older pve-wdcbalancer, or undef if unchanged).
+sub insert_line {
+    my ($orig, $anchor, $line, $what, $file) = @_;
+    my $content = strip_marked($orig);
+    $content =~ s/$anchor/$1$line/ or die "$what not found in $file\n";
+    return ($content, undef) if $content eq $orig;
+    return ($content, $orig =~ /\Q$MARK\E/ ? 'updated' : 'integrated');
+}
+
+sub apply_nodes {
+    my $orig = slurp($NODES_PM);
+
+    # register after the Disks subclass (and other packages' lines there),
+    # inside PVE::API2::Nodes::Nodeinfo
+    my $anchor = qr/(__PACKAGE__->register_method\s*\(\s*\{\s*subclass\s*=>\s*["']PVE::API2::Disks["'][^}]*\}\s*\);\n(?:[^\n]*# [a-z-]+-integration\n)*)/s;
+    my ($content, $res) = insert_line($orig, $anchor, $API_LINE, 'anchor (Disks subclass)', $NODES_PM);
+    return "already integrated" if !$res;
+
+    my $backup = "$NODES_PM.wdcbalancer-backup";
+    copy($NODES_PM, $backup) or die "backup failed - $!\n";
+    spew($NODES_PM, $content);
+
+    my $ok = system($^X, '-c', $NODES_PM) == 0; # prints "syntax OK"
+    if (!$ok) {
+        copy($backup, $NODES_PM);
+        die "$NODES_PM does not compile with the integration line - reverted\n";
+    }
+    unlink($backup);
+    return $res;
+}
+
+sub apply_index {
+    my $orig = slurp($INDEX_TPL);
+    my ($content, $res) = insert_line($orig, qr/(^.*pvemanagerlib\.js.*\n(?:.*<!-- [a-z-]+-integration -->\n)*)/m, $JS_LINE,
+        'pvemanagerlib.js script tag', $INDEX_TPL);
+    return "already integrated" if !$res;
+    spew($INDEX_TPL, $content);
+    return $res;
+}
+
+# Load the API module the way pveproxy will; its errors go to stderr.
+sub api_module_loads {
+    return system($^X, '-e', 'require PVE::API2::WDCBalancer') == 0;
+}
+
+sub remove_file {
+    my ($file) = @_;
+    return "not present" if ! -f $file;
+    my $content = slurp($file);
+    return "not integrated" if $content !~ /\Q$MARK\E/;
+    spew($file, strip_marked($content));
+    return "removed";
+}
+
+sub status_file {
+    my ($file, $line) = @_;
+    return "missing" if ! -f $file;
+    my $content = slurp($file);
+    return "NOT integrated" if $content !~ /\Q$MARK\E/;
+    return index($content, $line) >= 0 ? "integrated" : "integrated by an older pve-wdcbalancer (run 'apply')";
+}
+
+my $cmd = shift(@ARGV) // 'status';
+
+if ($cmd eq 'apply') {
+    my $failed = 0;
+    for my $step ([$NODES_PM, \&apply_nodes], [$INDEX_TPL, \&apply_index]) {
+        my $res = eval { $step->[1]->() };
+        if ($@) {
+            warn "wdcbalancer-integrate: $@";
+            $failed = 1;
+        } else {
+            print "$step->[0]: $res\n";
+        }
+    }
+    if (!api_module_loads()) {
+        warn "wdcbalancer-integrate: PVE::API2::WDCBalancer does not load (see above); the load balancing API and"
+            . " panel stay disabled, the rest of the Proxmox VE API is not affected\n";
+        $failed = 1;
+    }
+    exit($failed);
+} elsif ($cmd eq 'remove') {
+    print "$_: " . remove_file($_) . "\n" for $NODES_PM, $INDEX_TPL;
+} elsif ($cmd eq 'status') {
+    print "$NODES_PM: " . status_file($NODES_PM, $API_LINE) . "\n";
+    print "$INDEX_TPL: " . status_file($INDEX_TPL, $JS_LINE) . "\n";
+    my $loads = api_module_loads();
+    print "PVE::API2::WDCBalancer: " . ($loads ? "loads" : "FAILS to load - load balancing API disabled") . "\n";
+    exit($loads ? 0 : 1);
+} else {
+    die "usage: $0 apply|remove|status\n";
+}

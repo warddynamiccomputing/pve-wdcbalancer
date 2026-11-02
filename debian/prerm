@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        /usr/share/pve-wdcbalancer/wdcbalancer-integrate remove || true
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

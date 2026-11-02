@@ -1,0 +1,8 @@
+[Unit]
+Description=pve-wdcbalancer load balancing pass
+After=pve-cluster.service pvestatd.service
+Requires=pve-cluster.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/wdcbalancer timer-run

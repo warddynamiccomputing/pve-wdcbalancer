@@ -1,0 +1,21 @@
+Source: pve-wdcbalancer
+Section: admin
+Priority: optional
+Maintainer: pve-wdcbalancer maintainers <maintainers@example.invalid>
+Build-Depends: debhelper-compat (= 13), perl
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: pve-wdcbalancer
+Architecture: all
+Depends: pve-manager (>= 9.0),
+         pve-ha-manager,
+         ${misc:Depends},
+         ${perl:Depends},
+Description: Cluster load balancing for Proxmox VE (vSphere DRS-style)
+ Scores every guest by how much of its CPU and memory demand it gets,
+ balances the cluster by live migration recommendations, and enforces VM
+ groups, host groups and VM/Host and VM-VM rules, with automation levels,
+ a migration threshold and per-VM overrides. Adds a REST API under
+ /nodes/{node}/wdcbalancer, the 'wdcbalancer' CLI and a Datacenter >
+ Load Balancing panel in the web GUI.
