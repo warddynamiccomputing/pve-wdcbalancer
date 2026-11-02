@@ -1,7 +1,6 @@
 # Security policy
 
-pve-wdcbalancer runs as root on Proxmox VE nodes and recommends (and, from
-0.2, carries out) guest migrations, so security reports are welcome.
+pve-wdcbalancer runs as root on Proxmox VE nodes and recommends and carries out guest migrations, so security reports are welcome.
 
 ## Reporting a vulnerability
 
@@ -18,10 +17,15 @@ reproduce.
 - **What it reads:** guest and node usage from local RRD files, guest configs
   from pmxcfs, and cluster facts through `pvesh`. It talks to nothing outside
   the cluster.
-- **What it writes:** only `/etc/pve/wdcbalancer/` (configuration, last pass,
-  history, lease, node-facts cache). Configuration changes are validated and
+- **What it writes:** `/etc/pve/wdcbalancer/` (configuration, last pass,
+  history, lease, node-facts cache) and its own HA rules. Configuration changes are validated and
   written under the cluster lock.
-- **0.1 moves nothing:** it only recommends.
+- **Moves:** only through the apply API (needs `Sys.Modify` on `/` and
+  `VM.Migrate` on every moved guest) or, with full automation, by the timer
+  as `root@pam`. Every move is a Proxmox migration task; nothing else is
+  changed on the guests.
+- **HA rules:** only rules named `wdcb-*` with its marker comment are ever
+  changed or deleted.
 - **GUI:** everything that comes from guests or the configuration (names,
   comments, rule and group names, messages) is HTML-encoded, and IDs in URLs
   are URL-encoded.

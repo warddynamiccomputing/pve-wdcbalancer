@@ -50,6 +50,7 @@ our $SETTINGS = {
     migration_speed => [ 1000, { min => 10, max => 100000 }, 'Expected live-migration speed in MB/s (cost of a move).' ],
     containers => [ 'manual', { enum => [qw(manual restart)] },
         'Containers: manual (recommendations only, a move restarts them) or restart (may be moved with a restart).' ],
+    notify => [ 1, { bool => 1 }, 'Send notifications (Datacenter > Notifications) for new faults and for moves.' ],
 };
 
 our @RULE_TYPES = qw(together separate vm-host);

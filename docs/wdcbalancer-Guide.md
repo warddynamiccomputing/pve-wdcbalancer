@@ -1,6 +1,6 @@
 # pve-wdcbalancer guide
 
-Version 0.1.0
+Version 0.2.0
 
 How the balancer works, how it maps to vSphere DRS, and how to configure it.
 
@@ -9,11 +9,11 @@ How the balancer works, how it maps to vSphere DRS, and how to configure it.
 | vSphere DRS | pve-wdcbalancer | Notes |
 | --- | --- | --- |
 | DRS cluster | the Proxmox VE cluster | one configuration per cluster, on pmxcfs (`/etc/pve/wdcbalancer/`) |
-| Automation level: Manual / Partially / Fully Automated | `automation`: `manual` / `partial` / `full` | 0.1: `manual` only |
+| Automation level: Manual / Partially / Fully Automated | `automation`: `manual` / `partial` / `full` | `partial` places guests at power-on from 0.3 |
 | Migration threshold 1–5 | `threshold` 1–5 | same meaning: a recommendation is shown when its priority ≤ threshold |
 | VM DRS score, cluster DRS score | VM score, cluster score | 0–100 %, same buckets |
 | Run DRS Now | **Run now**, `wdcbalancer run` | |
-| DRS recommendations (apply / dismiss) | Recommendations (dismiss) | 0.1 recommends only |
+| DRS recommendations (apply / dismiss) | Recommendations: Apply, Apply all, Dismiss | |
 | VM Overrides (DRS automation level) | Overrides: `disabled`, `manual`, … | |
 | VM/Host groups | VM groups, host groups | |
 | VM/Host rules: must/should (not) run on | `vm-host` rules, `mode` = `must`, `should`, `must-not`, `should-not` | |
@@ -21,7 +21,8 @@ How the balancer works, how it maps to vSphere DRS, and how to configure it.
 | DRS faults | Faults | |
 | History | History | |
 | EVC | CPU check | guests with `cpu: host` (or `max`) only move between identical CPUs |
-| vMotion | live migration | |
+| vMotion | live migration | containers: restart migration; HA guests: HA migration |
+| DRS rules honoured by vSphere HA | rules mirrored into native HA rules | for HA guests |
 | Maintenance mode | 0.3 | nodes in HA maintenance are already avoided |
 | Initial placement | 0.3 (Power On (balanced)) | placement explanation already available |
 | DPM, resource pools | not planned | |
@@ -167,6 +168,73 @@ enabled rules. A conflicting rule can't be saved enabled:
 A violation that can't be fixed (for example, the guest is on local storage) is
 a **fault**.
 
+## Applying recommendations
+
+**Apply** (selected recommendations), **Apply all**, `wdcbalancer apply
+[--ids ...]` or `POST apply` start a task (`wdcbapply`, in the task list):
+
+- Moves run in the order of the pass, up to `max_concurrent` at a time per
+  node (the source and the target both count), one move per guest at a time.
+- Just before a move starts, the guest is checked again. It must still be on
+  its source node and unlocked, and the target must be online. If not, the
+  move is skipped and the reason logged.
+- **VMs** are live-migrated. **Containers** are migrated in restart mode,
+  so they restart on the new node. **HA guests** are moved with
+  `ha-manager crm-command migrate`, so HA doesn't move them back.
+- A move is done when the guest's config is on the target node. A failed
+  migration task is reported with its error. The task fails if any move
+  failed.
+- Moved guests start their cooldown, and every move is in the history with
+  its result and duration.
+
+Only one apply task runs at a time. Applying needs `Sys.Modify` on `/` and
+`VM.Migrate` on every guest that is moved. Nothing is moved while Proxmox CRS
+auto-rebalancing is on.
+
+## Automation
+
+| Level | What happens |
+| --- | --- |
+| `manual` | Recommendations only. |
+| `partial` | Recommendations only for balancing; from 0.3, guests are placed automatically at **Power On (balanced)**. |
+| `full` | After each pass, the timer applies the recommendations within the threshold in an apply task. |
+
+Per-VM overrides take precedence:
+- `disabled`: never moved.
+- `manual` or `partial`: recommended, never moved automatically.
+- `full`: moved automatically even when the cluster is `manual`.
+
+With full automation, containers are moved only when `containers` is
+`restart`. Otherwise they stay as recommendations, because moving them
+restarts them.
+
+## HA rules
+
+For guests under HA, every enabled rule is also written as a native HA rule,
+so the HA manager honours it when it starts, recovers or fences guests:
+
+| Rule | HA rule |
+| --- | --- |
+| VMs to hosts, must / should | node-affinity, positive, strict / not strict |
+| VMs to hosts, must not / should not | node-affinity, negative, strict / not strict |
+| Keep together / separate | resource-affinity, positive / negative (with at least two HA guests) |
+
+Mirrored rules are named `wdcb-<rule>` and carry the comment `managed by
+pve-wdcbalancer`. Only those are changed or deleted. A hand-made HA rule with
+the same name is left alone, and a fault reports the clash. The rules are
+synced after every rule or group change and on every pass. `wdcbalancer
+ha-sync` syncs them at once.
+
+## Notifications
+
+With `notify` on (the default), these go through the Proxmox VE notification
+system (**Datacenter → Notifications**; metadata `type=wdcbalancer`):
+- new faults, once per fault;
+- automatic moves (info, or warning if one failed);
+- failed moves applied by hand.
+
+The templates are `/usr/share/pve-manager/templates/default/wdcbalancer-alert-*.txt.hbs`.
+
 ## Settings
 
 | Setting | Default | |
@@ -175,13 +243,14 @@ a **fault**.
 | `threshold` | 3 | 1–5 |
 | `interval` | 300 | seconds between passes; also the averaging window |
 | `memory_metric` | `active` | or `consumed` |
-| `containers` | `manual` | `restart`: containers may be moved with a restart (from 0.2) |
+| `containers` | `manual` | `restart`: automation may move containers (with a restart) |
 | `max_moves` | 8 | balancing moves per pass |
-| `max_concurrent` | 2 | concurrent migrations per node (from 0.2) |
+| `max_concurrent` | 2 | concurrent migrations per node (source and target count) |
 | `cooldown` | 1800 | seconds |
 | `headroom` | 10 | % of node memory kept free |
 | `migration_speed` | 1000 | MB/s, for the cost of a move |
 | `network_aware` | 0 | |
+| `notify` | 1 | notifications for new faults and moves |
 | `net_capacity` | 1250 | MB/s per node |
 | `net_threshold` | 80 | % |
 
@@ -189,8 +258,7 @@ a **fault**.
 
 Proxmox VE 9.2's Cluster Resource Scheduler can rebalance HA guests itself
 (`crs: ha-auto-rebalance=1`). With both on, two balancers would compete, so
-while it is on, pve-wdcbalancer reports a fault and won't move anything (from
-0.2). HA placement modes (`ha=basic|static|dynamic`) for starting and
+while it is on, pve-wdcbalancer reports a fault and won't move anything. HA placement modes (`ha=basic|static|dynamic`) for starting and
 recovering HA guests are fine to keep.
 
 ## API
@@ -202,6 +270,8 @@ the configuration and the last pass are cluster-wide.
 | --- | --- | --- |
 | `status` | GET | scores, node load, last pass |
 | `recommendations` | GET | |
+| `apply` | POST `ids` (optional) | apply recommendations in a task; also needs `VM.Migrate` on each guest |
+| `ha-sync` | POST | mirror the rules into HA rules now |
 | `dismiss` | POST `id` | |
 | `run` | POST | Run DRS now |
 | `guests` | GET | VM scores and movability |

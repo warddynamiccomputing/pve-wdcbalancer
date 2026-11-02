@@ -16,11 +16,12 @@ use PVE::RESTHandler;
 use PVE::WDCBalancer::Collect;
 use PVE::WDCBalancer::Config;
 use PVE::WDCBalancer::Engine;
+use PVE::WDCBalancer::HARules;
 use PVE::WDCBalancer::State;
 
 use base qw(PVE::RESTHandler);
 
-our $VERSION = '0.1.0';
+our $VERSION = '0.2.0';
 
 my $PERM_AUDIT = ['perm', '/', ['Sys.Audit']];
 my $PERM_MODIFY = ['perm', '/', ['Sys.Modify']];
@@ -49,12 +50,12 @@ my $list = sub {
 
 my $result = sub { return PVE::WDCBalancer::State::read_state()->{result} // {}; };
 
-# This release only recommends; automatic moves come with applying them.
-my $only_manual = sub {
-    my ($level) = @_;
-    die "automation level '$level' is not available yet: this release only recommends moves (manual)
-"
-        if defined($level) && $level ne q(manual);
+# mirror rule changes into HA rules right away (the timer also does it each pass)
+my $ha_sync = sub {
+    my $r = eval { PVE::WDCBalancer::HARules::sync(PVE::WDCBalancer::Config::load()) };
+    warn "wdcbalancer: HA rule sync failed: $@" if $@;
+    warn "wdcbalancer: $_
+" for @{$r->{errors} // []};
 };
 
 $register->({
@@ -67,7 +68,7 @@ $register->({
     parameters => { additionalProperties => 0, properties => { node => $node_opt } },
     returns => { type => 'array', items => { type => 'object', properties => { name => { type => 'string' } } } },
     code => sub {
-        return [ map { { name => $_ } } qw(dismiss explain faults groups guests history overrides recommendations rules run settings status timer-run) ];
+        return [ map { { name => $_ } } qw(apply dismiss explain faults groups guests ha-sync history overrides recommendations rules run settings status timer-run) ];
     },
 });
 
@@ -98,6 +99,7 @@ $register->({
             nodes => [ map { $res->{nodes}->{$_} } sort keys %{$res->{nodes} // {}} ],
             recommendations => scalar(@{$res->{recommendations} // []}),
             faults => scalar(@{$res->{faults} // []}),
+            applying => PVE::WDCBalancer::State::apply_running($state) ? $state->{applying} : undef,
         };
     },
 });
@@ -155,10 +157,57 @@ $register->({
 });
 
 $register->({
+    name => 'apply',
+    path => 'apply',
+    method => 'POST',
+    description => "Apply recommendations (all, or the listed ones) in a task: live migration for VMs,"
+        . " restart migration for containers, HA migration for HA guests.",
+    permissions => {
+        description => "Sys.Modify on / and VM.Migrate on every guest that is moved.",
+        check => $PERM_MODIFY,
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => $node_opt,
+            ids => { type => 'string', optional => 1, maxLength => 65536,
+                description => 'Recommendation IDs, comma separated (default: all).' },
+        },
+    },
+    returns => { type => 'string', description => 'Task ID.' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $user = $rpcenv->get_user();
+        my $state = PVE::WDCBalancer::State::read_state();
+        die "Proxmox CRS automatic rebalancing (ha-auto-rebalance) is on; turn it off first, two balancers would compete\n"
+            if $state->{result}->{cluster}->{crs_conflict};
+        die "another apply task is running\n" if PVE::WDCBalancer::State::apply_running($state);
+        my $recs = PVE::WDCBalancer::State::pick(defined($param->{ids}) ? $list->($param->{ids}) : undef);
+        die "no recommendations to apply\n" if !@$recs;
+        $rpcenv->check($user, "/vms/$_->{vmid}", ['VM.Migrate']) for @$recs;
+        return $rpcenv->fork_worker('wdcbapply', undef, $user, sub {
+            PVE::WDCBalancer::State::apply($recs, trigger => $user);
+        });
+    },
+});
+
+$register->({
+    name => 'ha_sync',
+    path => 'ha-sync',
+    method => 'POST',
+    description => "Bring the HA rules mirrored from our rules in line now (the timer does it every pass).",
+    permissions => { check => $PERM_MODIFY },
+    parameters => { additionalProperties => 0, properties => { node => $node_opt } },
+    returns => { type => 'object' },
+    code => sub { return PVE::WDCBalancer::HARules::sync(PVE::WDCBalancer::Config::load()); },
+});
+
+$register->({
     name => 'run',
     path => 'run',
     method => 'POST',
-    description => "Run a balancing pass now (Run DRS now). Nothing is moved: this release only recommends.",
+    description => "Run a balancing pass now (Run DRS now). Moves are only made by apply, or by the timer with full automation.",
     permissions => { check => $PERM_MODIFY },
     parameters => { additionalProperties => 0, properties => { node => $node_opt } },
     returns => { type => 'object' },
@@ -293,7 +342,6 @@ $register->({
         my ($param) = @_;
         PVE::WDCBalancer::Config::update(sub {
             my ($cfg) = @_;
-            $only_manual->($param->{automation});
             for my $k (keys %$PVE::WDCBalancer::Config::SETTINGS) {
                 next if !defined($param->{$k});
                 $cfg->{settings}->{$k} = PVE::WDCBalancer::Config::check_setting($k, $param->{$k});
@@ -366,6 +414,7 @@ $register->({
                 defined($param->{comment}) ? (comment => $param->{comment}) : (),
             };
         });
+        $ha_sync->();
         return undef;
     },
 });
@@ -389,6 +438,7 @@ $register->({
             $g->{members} = $members->($k eq 'vm_groups' ? 'vm' : 'host', $param->{members}) if defined($param->{members});
             $g->{comment} = $param->{comment} if defined($param->{comment});
         });
+        $ha_sync->();
         return undef;
     },
 });
@@ -411,6 +461,7 @@ $register->({
             die "group '$param->{name}' is used by rule(s) @users\n" if @users;
             delete $cfg->{$k}->{$param->{name}};
         });
+        $ha_sync->();
         return undef;
     },
 });
@@ -495,6 +546,7 @@ $register->({
             $apply_rule->($r, $param);
             $cfg->{rules}->{$param->{name}} = $r;
         });
+        $ha_sync->();
         return undef;
     },
 });
@@ -517,6 +569,7 @@ $register->({
             my $r = $cfg->{rules}->{$param->{name}} // die "no rule '$param->{name}'\n";
             $apply_rule->($r, $param);
         });
+        $ha_sync->();
         return undef;
     },
 });
@@ -535,6 +588,7 @@ $register->({
             my ($cfg) = @_;
             delete($cfg->{rules}->{$param->{name}}) // die "no rule '$param->{name}'\n";
         });
+        $ha_sync->();
         return undef;
     },
 });
@@ -576,7 +630,6 @@ $register->({
         my ($param) = @_;
         PVE::WDCBalancer::Config::update(sub {
             my ($cfg) = @_;
-            $only_manual->($param->{automation}) if $param->{automation} ne q(disabled);
             $cfg->{overrides}->{$param->{vmid}} = { automation => $param->{automation} };
         });
         return undef;

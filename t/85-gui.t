@@ -56,10 +56,13 @@ for my $x ($dc =~ /xtype: '(pveWdcb\w+)'/g) {
     like($js, qr/alias: 'widget\.\Q$x\E'/, "$x is defined");
 }
 
-# this release only recommends
-unlike($js, qr/['"]migrate['"]|\/migrate\b/, 'the GUI starts no migrations');
+# moves only go through the apply API (permission checks, limits, history)
+unlike($js, qr/['"]migrate['"]|\/migrate\b/, 'the GUI never migrates guests itself');
+like($js, qr/Utils\.url\('apply'\)/, 'it uses the apply API');
+like($js, qr/Ext\.Msg\.confirm\(gettext\('Apply recommendations'\)/, 'applying asks first');
+like($js, qr/Proxmox\.window\.TaskViewer/, 'and shows the task');
 my ($ov) = class_body('PVE.wdcb.OverrideEdit') // '';
-unlike($ov, qr/\['partial'|\['full'/, 'overrides offer only disabled and manual');
+like($ov, qr/\['disabled', 'manual', 'partial', 'full'\]/, 'overrides offer all four levels');
 
 # methods must not replace ExtJS component methods (a tab panel calls show())
 my @clash = $js =~ /^    (show|hide|close|load|render|destroy|update|enable|disable|focus|add|remove|setTitle)\s*:\s*function/mg;

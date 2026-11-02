@@ -10,6 +10,7 @@ use PVE::CLIFormatter;
 use PVE::CLIHandler;
 use PVE::INotify;
 use PVE::RPCEnvironment;
+use PVE::Tools;
 
 use PVE::API2::WDCBalancer;
 
@@ -65,6 +66,26 @@ my $print_status = sub {
     }
 };
 
+# Apply runs as a task; in the CLI it runs in the foreground, but a failed
+# task would still exit 0. Exit non-zero so scripts can rely on it.
+my $task = sub {
+    my ($upid) = @_;
+    my $status = PVE::Tools::upid_read_status($upid);
+    exit(1) if $status ne 'OK';
+};
+
+my $print_history = sub {
+    my ($data, $schema, $options) = @_;
+    if (($options->{'output-format'} // 'text') eq 'text') {
+        $data = [ map { +{ %$_, time => scalar(localtime($_->{time})),
+            details => $_->{type} eq 'move' ? "$_->{vmid}: $_->{from} -> $_->{to} $_->{result}" . ($_->{message} ? " ($_->{message})" : '')
+                : $_->{type} eq 'dismiss' ? "$_->{vmid}: $_->{from} -> $_->{to}"
+                : $_->{type} eq 'ha-rules' ? join('; ', @{$_->{changes} // []}, @{$_->{errors} // []})
+                : "score $_->{score}, $_->{recommendations} recommendation(s), $_->{faults} fault(s)" } } @$data ];
+    }
+    PVE::CLIFormatter::print_api_result($data, $schema, [qw(time type node trigger user details)], $options);
+};
+
 my $node = { node => $nodename };
 my $fmt = $PVE::RESTHandler::standard_output_options;
 my $api = 'PVE::API2::WDCBalancer';
@@ -78,7 +99,9 @@ our $cmddef = {
     guests => [ $api, 'guests', [], $node,
         $table->(qw(vmid name type node status score expected cpu_demand mem_demand automation movable reason)), $fmt ],
     faults => [ $api, 'faults', [], $node, $table->(qw(type rule message)), $fmt ],
-    history => [ $api, 'history', [], $node, $table->(qw(time type node trigger score recommendations faults user id)), $fmt ],
+    history => [ $api, 'history', [], $node, $print_history, $fmt ],
+    apply => [ $api, 'apply', [], $node, $task ],
+    'ha-sync' => [ $api, 'ha_sync', [], $node, $print_obj, $fmt ],
     explain => [ $api, 'explain', ['vmid'], $node, $table->(qw(node current ok score gain cpu mem reason)), $fmt ],
 
     settings => {

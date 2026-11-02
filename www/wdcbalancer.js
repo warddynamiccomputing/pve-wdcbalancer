@@ -6,6 +6,10 @@
 // (names) and from the configuration (group and rule names, comments) is
 // HTML-encoded.
 
+Proxmox.Utils.override_task_descriptions({
+    wdcbapply: ['Load Balancing', gettext('Apply recommendations')],
+});
+
 Ext.define('PVE.wdcb.Utils', {
     singleton: true,
 
@@ -86,6 +90,29 @@ Ext.define('PVE.wdcb.Utils', {
 	Proxmox.Utils.API2Request(Ext.apply({
 	    failure: response => Ext.Msg.alert(gettext('Error'), response.htmlStatus),
 	}, opts));
+    },
+
+    // apply recommendations (all when ids is undefined) and follow the task
+    apply: function(ids, panel) {
+	let n = ids ? ids.length : gettext('all');
+	Ext.Msg.confirm(gettext('Apply recommendations'),
+	    Ext.htmlEncode(Ext.String.format(gettext('Migrate the guests of {0} recommendation(s) now? Containers are restarted on their new node.'), n)),
+	    function(btn) {
+		if (btn !== 'yes') {
+		    return;
+		}
+		PVE.wdcb.Utils.request({
+		    url: PVE.wdcb.Utils.url('apply'),
+		    method: 'POST',
+		    params: ids ? { ids: ids.join(',') } : {},
+		    waitMsgTarget: panel,
+		    success: function(response) {
+			let win = Ext.create('Proxmox.window.TaskViewer', { upid: response.result.data });
+			win.on('destroy', () => panel.reload());
+			win.show();
+		    },
+		});
+	    });
     },
 });
 
@@ -203,6 +230,12 @@ Ext.define('PVE.wdcb.Summary', {
 		+ enc(gettext('Proxmox CRS automatic rebalancing (Datacenter > Options > Cluster Resource Scheduling, ha-auto-rebalance) is on. Two balancers would compete, so no moves are made until it is turned off.'))
 		+ '</div>';
 	}
+	if (d.applying) {
+	    html += `<div style="padding:6px;margin-bottom:8px;border:1px solid #3892d4">`
+		+ enc(Ext.String.format(gettext('Applying {0} recommendation(s) (task on {1}, started {2}).'),
+		    d.applying.count, d.applying.node, Proxmox.Utils.render_timestamp(d.applying.time)))
+		+ '</div>';
+	}
 	if (!d.time) {
 	    html += enc(gettext('No balancing pass yet. The timer runs one within a few minutes, or click Run now.'));
 	} else {
@@ -296,10 +329,24 @@ Ext.define('PVE.wdcb.RecGrid', {
 	},
     ]),
 
+    selModel: { selType: 'rowmodel', mode: 'MULTI' },
+
     initComponent: function() {
 	let me = this;
 	me.tbar = [
 	    PVE.wdcb.runNowButton(me),
+	    {
+		xtype: 'proxmoxButton',
+		text: gettext('Apply'),
+		iconCls: 'fa fa-check',
+		disabled: true,
+		handler: () => PVE.wdcb.Utils.apply(me.getSelection().map(r => r.data.id), me),
+	    },
+	    {
+		text: gettext('Apply all'),
+		iconCls: 'fa fa-check-square-o',
+		handler: () => me.store.getCount() && PVE.wdcb.Utils.apply(undefined, me),
+	    },
 	    {
 		xtype: 'proxmoxButton',
 		text: gettext('Dismiss'),
@@ -319,12 +366,6 @@ Ext.define('PVE.wdcb.RecGrid', {
 		text: gettext('Placement'),
 		disabled: true,
 		handler: () => Ext.create('PVE.wdcb.ExplainWindow', { vmid: me.selected().data.vmid }).show(),
-	    },
-	    {
-		xtype: 'displayfield',
-		value: gettext('This release recommends only; apply a recommendation by migrating the guest.'),
-		userCls: 'pmx-hint',
-		margin: '0 0 0 10',
 	    },
 	];
 	me.callParent();
@@ -358,10 +399,10 @@ Ext.define('PVE.wdcb.OverrideEdit', {
 		    name: 'automation',
 		    fieldLabel: gettext('Automation level'),
 		    value: me.automation || 'disabled',
-		    comboItems: [['disabled', PVE.wdcb.Utils.automation.disabled], ['manual', PVE.wdcb.Utils.automation.manual]],
+		    comboItems: ['disabled', 'manual', 'partial', 'full'].map(k => [k, PVE.wdcb.Utils.automation[k]]),
 		},
 		{ xtype: 'displayfield', userCls: 'pmx-hint',
-		    value: gettext('Disabled: the guest is never moved for balancing or rules. Partially and fully automated arrive with automatic moves.') },
+		    value: gettext('Disabled: never moved for balancing or rules. Manual and partially automated: recommendations only. Fully automated: moved automatically, even when the cluster is set to manual.') },
 	    ],
 	}];
 	me.url = PVE.wdcb.Utils.url('overrides');
@@ -455,8 +496,20 @@ Ext.define('PVE.wdcb.HistoryGrid', {
 	    header: gettext('Details'),
 	    dataIndex: 'id',
 	    flex: 1,
-	    renderer: (v, m, rec) => Ext.htmlEncode(rec.data.type === 'dismiss'
-		? Ext.String.format(gettext('guest {0}: {1} to {2}'), rec.data.vmid, rec.data.from, rec.data.to) : ''),
+	    renderer: function(v, m, rec) {
+		let d = rec.data;
+		if (d.type === 'dismiss') {
+		    return Ext.htmlEncode(Ext.String.format(gettext('guest {0}: {1} to {2}'), d.vmid, d.from, d.to));
+		}
+		if (d.type === 'move') {
+		    return Ext.htmlEncode(Ext.String.format(gettext('guest {0}: {1} to {2}, {3}'), d.vmid, d.from, d.to,
+			d.result === 'ok' ? `OK (${d.duration} s)` : `${d.result}: ${d.message || ''}`));
+		}
+		if (d.type === 'ha-rules') {
+		    return Ext.htmlEncode([].concat(d.changes || [], d.errors || []).join('; '));
+		}
+		return '';
+	    },
 	},
     ]),
 });
@@ -480,13 +533,17 @@ Ext.define('PVE.wdcb.SettingsEdit', {
 	me.items = [{
 	    xtype: 'inputpanel',
 	    onGetValues: function(values) {
-		delete values.automation_display;
 		values.network_aware = values.network_aware ? 1 : 0;
+		values.notify = values.notify ? 1 : 0;
 		return values;
 	    },
 	    column1: [
-		{ xtype: 'displayfield', name: 'automation_display', fieldLabel: gettext('Automation level'),
-		    value: PVE.wdcb.Utils.automation.manual },
+		{
+		    xtype: 'proxmoxKVComboBox',
+		    name: 'automation',
+		    fieldLabel: gettext('Automation level'),
+		    comboItems: ['manual', 'partial', 'full'].map(k => [k, PVE.wdcb.Utils.automation[k]]),
+		},
 		{
 		    xtype: 'sliderfield',
 		    name: 'threshold',
@@ -521,6 +578,11 @@ Ext.define('PVE.wdcb.SettingsEdit', {
 		{ xtype: 'proxmoxcheckbox', name: 'network_aware', fieldLabel: gettext('Network-aware'), defaultValue: 0, deleteDefaultValue: false },
 		{ xtype: 'proxmoxintegerfield', name: 'net_capacity', fieldLabel: gettext('Network capacity (MB/s)'), minValue: 10, maxValue: 1000000 },
 		{ xtype: 'proxmoxintegerfield', name: 'net_threshold', fieldLabel: gettext('Network saturated at (%)'), minValue: 10, maxValue: 100 },
+		{ xtype: 'proxmoxcheckbox', name: 'notify', fieldLabel: gettext('Notifications'), defaultValue: 0, deleteDefaultValue: false },
+	    ],
+	    columnB: [
+		{ xtype: 'displayfield', userCls: 'pmx-hint',
+		    value: gettext('Fully automated: the recommendations within the threshold are applied every pass. Partially automated and manual: recommendations only; apply them yourself.') },
 	    ],
 	}];
 	me.callParent();
@@ -528,7 +590,6 @@ Ext.define('PVE.wdcb.SettingsEdit', {
 	    success: function(response) {
 		let d = response.result.data;
 		me.setValues(d);
-		me.down('[name=automation_display]').setValue(PVE.wdcb.Utils.automation[d.automation] || d.automation);
 		hint(d.threshold);
 	    },
 	});
@@ -559,6 +620,7 @@ Ext.define('PVE.wdcb.SettingsView', {
 	    network_aware: { header: gettext('Network-aware'), renderer: Proxmox.Utils.format_boolean },
 	    net_capacity: { header: gettext('Network capacity (MB/s)') },
 	    net_threshold: { header: gettext('Network saturated at (%)') },
+	    notify: { header: gettext('Notifications'), renderer: Proxmox.Utils.format_boolean },
 	};
 	let edit = () => {
 	    let w = Ext.create('PVE.wdcb.SettingsEdit');

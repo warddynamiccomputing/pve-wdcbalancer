@@ -1,3 +1,21 @@
+pve-wdcbalancer (0.2.0) trixie; urgency=medium
+
+  * Recommendations can be applied: live migration for VMs, restart
+    migration for containers, HA migration for HA guests, in a task with
+    up to max_concurrent moves per node. Each move is checked again just
+    before it starts.
+  * Automation levels: with full automation the timer applies the
+    recommendations within the threshold; per-VM overrides (disabled,
+    manual, partial, full) and the container setting are honoured. No
+    moves while Proxmox CRS auto-rebalancing is on.
+  * Rules are mirrored into native HA rules for HA guests (node-affinity
+    and resource-affinity, named wdcb-<rule>); hand-made HA rules are
+    never touched.
+  * Notifications for new faults and moves; move history with results.
+  * CLI: apply, ha-sync; readable times in history.
+
+ -- pve-wdcbalancer maintainers <maintainers@example.invalid>  Mon, 02 Nov 2026 22:12:02 +0000
+
 pve-wdcbalancer (0.1.0) trixie; urgency=medium
 
   * First release: cluster load balancing that recommends moves.
