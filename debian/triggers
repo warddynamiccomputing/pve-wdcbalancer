@@ -1,0 +1,3 @@
+# pve-manager upgrades replace the files wdcbalancer-integrate patches
+interest-noawait /usr/share/perl5/PVE/API2/Nodes.pm
+interest-noawait /usr/share/pve-manager/index.html.tpl

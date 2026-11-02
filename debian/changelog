@@ -1,0 +1,12 @@
+pve-wdcbalancer (0.1.0) trixie; urgency=medium
+
+  * First release: cluster load balancing that recommends moves.
+    Scores every guest (CPU and memory demand from usage and pressure),
+    recommends live migrations with priority and reason for maintenance,
+    rule violations and load balancing (migration threshold 1-5), with VM
+    and host groups, VM/Host must/should rules, keep-together and
+    keep-apart rules, per-VM overrides, a placement explanation per guest,
+    the Datacenter > Load Balancing panel, the wdcbalancer CLI and a REST
+    API. Nothing is moved automatically yet.
+
+ -- pve-wdcbalancer maintainers <maintainers@example.invalid>  Mon, 02 Nov 2026 21:27:24 +0000

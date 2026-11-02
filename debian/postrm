@@ -1,0 +1,20 @@
+#!/bin/sh
+
+set -e
+
+case "$1" in
+    remove|purge)
+        for service in pvedaemon pveproxy; do
+            if systemctl -q is-active "$service" 2>/dev/null; then
+                systemctl reload-or-restart "$service" || true
+            fi
+        done
+        ;;
+esac
+
+# /etc/pve/wdcbalancer (settings, groups, rules) is cluster-wide and stays:
+# other nodes may still use it
+
+#DEBHELPER#
+
+exit 0

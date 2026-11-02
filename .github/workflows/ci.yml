@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:   # rebuild the apt repository from the existing releases
+
+# Read-only by default; only the release and apt-repo jobs get more.
+# Actions are pinned to commit SHAs (the tag is in the comment); Dependabot
+# proposes updates.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential debhelper perl nodejs git ca-certificates shellcheck libperl-critic-perl
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Unit tests (PVE modules stubbed)
+        run: make test
+
+      - name: GUI syntax check
+        run: node --check www/wdcbalancer.js
+
+      - name: Lint (shellcheck, perlcritic)
+        run: make lint
+
+      - name: Build package
+        run: |
+          make deb
+          mkdir -p dist
+          mv ../pve-wdcbalancer_*_all.deb dist/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pve-wdcbalancer-deb
+          path: dist/*.deb
+
+  # Tags only: checksums, build provenance, and the files on the release.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # attach files to the release
+      id-token: write       # sign the provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pve-wdcbalancer-deb
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.deb > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.deb
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/*.deb
+            dist/SHA256SUMS
+
+  # apt repository on GitHub Pages, built from every release's .deb
+  apt-repo:
+    needs: [build, release]
+    if: >-
+      always() && needs.build.result == 'success' &&
+      (needs.release.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils gnupg
+
+      - name: Fetch every released package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/pool/main
+          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName'); do
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir site/pool/main --skip-existing
+          done
+          ls -l site/pool/main
+
+      - id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Build and sign the repository
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: sh tools/build-apt-repo.sh site "$BASE_URL"
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
