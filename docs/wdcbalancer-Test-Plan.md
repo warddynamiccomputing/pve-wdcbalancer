@@ -1,6 +1,6 @@
 # pve-wdcbalancer 1.0 acceptance test
 
-Version 0.3.0
+Version 0.4.0
 
 The checks a cluster must pass before pve-wdcbalancer is called 1.0. They need
 real live migrations, so they run on a lab cluster with **shared storage**

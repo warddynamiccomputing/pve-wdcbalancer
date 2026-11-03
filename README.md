@@ -36,8 +36,11 @@ balancer only acts on HA resources.
 | Faults and history | Violations that can't be fixed, and a conflict with Proxmox CRS auto-rebalancing. A history of passes and dismissals. |
 | Interfaces | GUI (**Datacenter → Load Balancing**), the `wdcbalancer` CLI, and a REST API under `/nodes/{node}/wdcbalancer`. |
 
-How it maps to vSphere and how the scores are computed:
-[docs/wdcbalancer-Guide.md](docs/wdcbalancer-Guide.md).
+## Documentation
+
+- [Runbook](docs/wdcbalancer-Runbook.md) ([PDF](docs/wdcbalancer-Runbook.pdf)): install, every procedure, settings, troubleshooting, monitoring, CLI/API reference
+- [How It Works](docs/wdcbalancer-How-It-Works.md) ([PDF](docs/wdcbalancer-How-It-Works.pdf)): the DRS mapping, architecture, data model, the pass step by step, scores and costs, locking, applying, HA mirroring, tests
+- [1.0 test plan](docs/wdcbalancer-Test-Plan.md): the checks on a cluster with shared storage before 1.0
 
 ## Requirements
 
@@ -47,11 +50,14 @@ How it maps to vSphere and how the scores are computed:
 
 ## Install
 
-On every node of the cluster:
+On every node of the cluster, from the signed apt repository (setup in the
+[Runbook](docs/wdcbalancer-Runbook.md#installation-upgrade-uninstall)):
 
 ```bash
-apt install ./pve-wdcbalancer_0.4.0_all.deb
+apt install pve-wdcbalancer
 ```
+
+or from a release `.deb`: `apt install ./pve-wdcbalancer_0.4.0_all.deb`.
 
 The package:
 - adds its API and GUI to `pve-manager` (one marked line each, re-applied after

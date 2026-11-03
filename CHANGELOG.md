@@ -5,6 +5,7 @@ the readable summary.
 
 ## 0.4.0
 Hardening before 1.0; no new settings.
+- **Documentation**: a Runbook (install, procedures, troubleshooting, reference) and a How It Works guide (design and internals), each also as PDF, replace the single guide.
 - **Safe concurrent writers.** Passes, apply tasks and dismissals update
   `state.json` under the cluster lock without undoing each other: **Run now**
   during an apply no longer hides the running task (which let a second apply
