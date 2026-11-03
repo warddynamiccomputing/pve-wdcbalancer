@@ -69,6 +69,9 @@ sub cluster {
         qr/'t' and 's' conflict/, 'together vs separate');
     is($conf->(t => { type => 'together', vms => [101, 102] }, s => { type => 'separate', vms => [102, 103] }), '',
         'sharing one VM is fine');
+    like($conf->(t1 => { type => 'together', vms => [101, 105] }, t2 => { type => 'together', vms => [102, 105] },
+        s => { type => 'separate', vms => [101, 102, 106] }),
+        qr/'t1', 't2' and 's' conflict: VMs 101 102 must be kept together/, 'keep-together rules that share a VM tie all of them');
     like($conf->(m1 => { type => 'vm-host', vm_group => 'a', host_group => 'h1', mode => 'must' },
         m2 => { type => 'vm-host', vm_group => 'a', host_group => 'h2', mode => 'must' }),
         qr/VM 101 is left with no node/, 'two must rules with disjoint hosts');

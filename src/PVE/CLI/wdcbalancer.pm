@@ -58,6 +58,12 @@ my $print_status = sub {
     printf("guests: %d running, %d movable; %d recommendation(s), %d fault(s)\n",
         $c->{running} // 0, $c->{movable} // 0, $data->{recommendations}, $data->{faults});
     print "WARNING: Proxmox CRS ha-auto-rebalance is on; no moves are made while it is\n" if $c->{crs_conflict};
+    print "WARNING: the cluster is not quorate; no moves are recommended\n" if defined($c->{quorate}) && !$c->{quorate};
+    print "load balancing on hold: $c->{hold}\n" if $c->{hold};
+    printf("WARNING: automation paused since %s: %s ('wdcbalancer resume' resumes it)\n",
+        scalar(localtime($data->{breaker}->{time})), $data->{breaker}->{reason}) if $data->{breaker};
+    printf("applying %d recommendation(s) (task on %s)\n", $data->{applying}->{count} // 0, $data->{applying}->{node} // '?')
+        if $data->{applying};
     printf("\n%-16s %6s %6s %8s %8s %6s %s\n", 'NODE', 'CPU', 'MEM', 'CPU AFT', 'MEM AFT', 'GUESTS', 'STATE');
     for my $n (@{$data->{nodes} // []}) {
         printf("%-16s %6s %6s %8s %8s %6d %s\n", $n->{node}, $pct->($n->{cpu}), $pct->($n->{mem}),
@@ -81,7 +87,9 @@ my $print_history = sub {
             details => $_->{type} eq 'move' ? "$_->{vmid}: $_->{from} -> $_->{to} $_->{result}" . ($_->{message} ? " ($_->{message})" : '')
                 : $_->{type} eq 'dismiss' ? "$_->{vmid}: $_->{from} -> $_->{to}"
                 : $_->{type} eq 'ha-rules' ? join('; ', @{$_->{changes} // []}, @{$_->{errors} // []})
-                : "score $_->{score}, $_->{recommendations} recommendation(s), $_->{faults} fault(s)" } } @$data ];
+                : $_->{type} eq 'pass' ? "score $_->{score}, $_->{recommendations} recommendation(s), $_->{faults} fault(s)"
+                : $_->{type} eq 'maintenance' ? "$_->{node}: $_->{action}"
+                : $_->{reason} // '' } } @$data ];
     }
     PVE::CLIFormatter::print_api_result($data, $schema, [qw(time type node trigger user details)], $options);
 };
@@ -93,6 +101,7 @@ my $api = 'PVE::API2::WDCBalancer';
 our $cmddef = {
     status => [ $api, 'status', [], $node, $print_status, $fmt ],
     run => [ $api, 'run', [], $node, $print_obj, $fmt ],
+    resume => [ $api, 'resume', [], $node, $print_obj, $fmt ],
     recommendations => [ $api, 'recommendations', [], $node,
         $table->(qw(priority vmid name from to reason gain kind rule id)), $fmt ],
     dismiss => [ $api, 'dismiss', ['id'], $node ],

@@ -242,6 +242,24 @@ Ext.define('PVE.wdcb.Summary', {
 	me.nodeStore = Ext.create('Ext.data.Store', { sorters: 'node' });
 	me.tbar = [
 	    PVE.wdcb.runNowButton(me),
+	    {
+		text: gettext('Resume automation'),
+		itemId: 'resume',
+		iconCls: 'fa fa-play-circle',
+		hidden: true,
+		handler: () => Ext.Msg.confirm(gettext('Resume automation'),
+		    gettext('Automation was paused because moves failed. Resume it now?'), function(btn) {
+			if (btn !== 'yes') {
+			    return;
+			}
+			PVE.wdcb.Utils.request({
+			    url: PVE.wdcb.Utils.url('resume'),
+			    method: 'POST',
+			    waitMsgTarget: me,
+			    success: () => me.reload(),
+			});
+		    }),
+	    },
 	    '->',
 	    { text: gettext('Reload'), iconCls: 'fa fa-refresh', handler: () => me.reload() },
 	];
@@ -295,6 +313,21 @@ Ext.define('PVE.wdcb.Summary', {
 		+ enc(gettext('Proxmox CRS automatic rebalancing (Datacenter > Options > Cluster Resource Scheduling, ha-auto-rebalance) is on. Two balancers would compete, so no moves are made until it is turned off.'))
 		+ '</div>';
 	}
+	if (d.breaker) {
+	    html += `<div style="padding:6px;margin-bottom:8px;border:1px solid #c9302c;color:#c9302c">`
+		+ enc(Ext.String.format(gettext('Automation is paused since {0}: {1}. Moves are still recommended; resume automation once the cause is fixed.'),
+		    Proxmox.Utils.render_timestamp(d.breaker.time), d.breaker.reason))
+		+ '</div>';
+	}
+	if (c.quorate === 0) {
+	    html += `<div style="padding:6px;margin-bottom:8px;border:1px solid #c9302c;color:#c9302c">`
+		+ enc(gettext('The cluster is not quorate: no moves are recommended until quorum is back.'))
+		+ '</div>';
+	} else if (c.hold) {
+	    html += `<div style="padding:6px;margin-bottom:8px;border:1px solid #f0ad4e">`
+		+ enc(Ext.String.format(gettext('Load balancing is on hold: {0}. Only mandatory moves are recommended.'), c.hold))
+		+ '</div>';
+	}
 	if (d.applying) {
 	    html += `<div style="padding:6px;margin-bottom:8px;border:1px solid #3892d4">`
 		+ enc(Ext.String.format(gettext('Applying {0} recommendation(s) (task on {1}, started {2}).'),
@@ -329,6 +362,7 @@ Ext.define('PVE.wdcb.Summary', {
 		+ `<div>${enc(gettext('Next pass'))}: ${PVE.wdcb.Utils.renderTime(d.next)}</div>`
 		+ '</td></tr></table>';
 	}
+	me.down('#resume').setHidden(!d.breaker);
 	me.down('#info').update(html);
 	me.nodeStore.setData(d.nodes || []);
     },

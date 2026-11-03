@@ -18,6 +18,7 @@ package PVE::WDCBalancer::Collect;
 #   vnets    => { name => 1 },
 #   ha_rules => [ { id, type, resources, nodes, strict, affinity } ],
 #   crs      => { ha, auto_rebalance },
+#   quorate  => 0 | 1,
 #   warnings => [ ... ],
 # }
 #
@@ -363,6 +364,7 @@ sub snapshot {
         vnets => { map { $_->{vnet} => 1 } grep { $_->{vnet} } @$vnets },
         ha_rules => ha_rules(),
         crs => crs_settings(),
+        quorate => (eval { PVE::Cluster::check_cfs_quorum(1) } ? 1 : 0),
         warnings => \@warnings,
     };
 }

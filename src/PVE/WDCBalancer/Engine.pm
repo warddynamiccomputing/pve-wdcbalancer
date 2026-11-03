@@ -14,11 +14,21 @@ package PVE::WDCBalancer::Engine;
 #   2. soft VM/Host rule ('should') violations, priority 2 (threshold >= 2)
 #   3. load balancing (threshold >= 2): repeatedly the single move with the
 #      best gain in the objective (cluster score minus imbalance) after its
-#      cost, until no move reaches the threshold's priority or max_moves.
+#      cost (see move_cost; moving a guest back where it just came from costs
+#      more), until no move reaches the threshold's priority or max_moves,
+#      or every VM is happy and the imbalance is within the threshold's
+#      tolerance.
 #      Balancing never breaks a rule, 'should' rules included.
 #
 # Recommendations are what the moves would be in this order; each later one
 # assumes the earlier ones were applied.
+#
+# Holds (each one a fault):
+#   - no quorum: nothing is recommended
+#   - the online nodes changed less than $opts{settling} seconds ago, or
+#     usage data is missing (an online node, or more than $STALE_SHARE of
+#     the running guests, without samples in the window): only mandatory
+#     moves; a guest without samples is never moved for balancing
 
 use strict;
 use warnings;
@@ -30,6 +40,7 @@ use PVE::WDCBalancer::Constraints;
 use PVE::WDCBalancer::Score;
 
 our $DISMISS_TTL = 3600;
+our $STALE_SHARE = 0.25;
 
 # Priority of a balancing move from its net gain in VM-score points (the
 # sum over all guests, so one move that relieves a contended node counts for
@@ -43,13 +54,30 @@ sub priority_for_gain {
     return undef;
 }
 
-# each minute of migration time costs two points
+# A migration costs $MOVE_COST points (the stun at switch-over, load on the
+# migration network, the risk of a failure) plus two points per minute it
+# takes. Without the fixed part, load noise alone would justify moves.
+our $MOVE_COST = 3;
+
 sub move_cost {
     my ($snap, $settings, $vmids) = @_;
     my $bytes = sum0(map { PVE::WDCBalancer::Score::guest_footprint($snap->{guests}->{$_}) } @$vmids);
     my $speed = ($settings->{migration_speed} // 1000) * 1_000_000;
-    return 2 * $bytes / $speed / 60;
+    return $MOVE_COST * @$vmids + 2 * $bytes / $speed / 60;
 }
+
+# Moving a guest back to a node it left less than $BOUNCE_WINDOW seconds ago
+# costs $BOUNCE_COST more points per guest: going back and forth between the
+# same nodes is churn, unless the load really changed.
+our $BOUNCE_WINDOW = 4 * 3600;
+our $BOUNCE_COST = 25;
+
+# Tolerated imbalance per migration threshold (vSphere: the target
+# imbalance). Within it, load noise would make small moves look worthwhile:
+# only priority 2 moves (clear contention) are made, and none at all while
+# every VM scores at least $HAPPY.
+our %TOLERANCE = (2 => 0.20, 3 => 0.15, 4 => 0.10, 5 => 0.07);
+our $HAPPY = 95;
 
 # connected keep-together groups: vmid => [ members ]
 sub together_units {
@@ -78,6 +106,11 @@ sub pass {
     my $now = $opts{now} // time();
     my $moved = $opts{moved} // {};
     my $dismissed = $opts{dismissed} // {};
+    my $left = $opts{left} // {}; # vmid => { node, time }: where it was before its last move
+    my $bounce = sub {
+        my ($unit, $t) = @_;
+        return $BOUNCE_COST * scalar(grep { ($left->{$_}->{node} // '') eq $t && $now - ($left->{$_}->{time} // 0) < $BOUNCE_WINDOW } @$unit);
+    };
     my $rules = PVE::WDCBalancer::Config::enabled_rules($cfg);
     my @all_nodes = sort keys %{$snap->{nodes}};
 
@@ -128,7 +161,8 @@ sub pass {
             return (0, $why) if !$ok;
             for my $r (@{$separate_of{$vmid} // []}) {
                 for my $other (@{$r->{vms}}) {
-                    next if $other == $vmid || $moving{$other};
+                    next if $other == $vmid;
+                    return (0, "rule '$r->{name}' keeps it apart from $other") if $moving{$other};
                     return (0, "rule '$r->{name}' keeps it apart from $other")
                         if ($placement{$other} // '') eq $target;
                 }
@@ -162,12 +196,26 @@ sub pass {
         return ($best, $best_obj, $last_err);
     };
 
+    # One recommendation per guest and pass: a guest that a later fix moves
+    # on (a maintenance evacuation, then its keep-together partner's rule)
+    # gets its recommendation re-targeted, or dropped when it ends up where
+    # it started. It goes last: it was planned on the state after the others.
+    my %rec_of;
     my $record = sub {
         my ($vmids, $target, %r) = @_;
         for my $vmid (@$vmids) {
             my $from = $placement{$vmid};
             my $g = $snap->{guests}->{$vmid};
-            push @recs, {
+            if (my $old = delete $rec_of{$vmid}) {
+                @recs = grep { $_ != $old } @recs;
+                $from = $old->{from};
+                if ($from eq $target) {
+                    $placement{$vmid} = $target;
+                    next;
+                }
+                $r{priority} = min($r{priority}, $old->{priority});
+            }
+            push @recs, $rec_of{$vmid} = {
                 id => "$vmid:$from:$target",
                 vmid => $vmid + 0,
                 name => $g->{name} // '',
@@ -178,6 +226,7 @@ sub pass {
                 kind => $r{kind},
                 reason => $r{reason},
                 gain => sprintf('%.1f', $r{gain} // 0) + 0,
+                mem => int(PVE::WDCBalancer::Score::guest_footprint($g)),
                 ha => $g->{ha} ? 1 : 0,
                 restart => $g->{type} eq 'lxc' ? 1 : 0,
                 $r{rule} ? (rule => $r{rule}) : (),
@@ -218,6 +267,25 @@ sub pass {
         return [ grep { ($placement{$_} // '') eq $placement{$vmid} } @{ $units->{$vmid} // [ $vmid ] } ];
     };
 
+    # ---- holds ----
+    my $quorum_lost = exists($snap->{quorate}) && !$snap->{quorate};
+    my $hold;
+    my %no_data = map { $_ => 1 } grep { exists($snap->{guests}->{$_}->{samples}) && !$snap->{guests}->{$_}->{samples} }
+        keys %placement;
+    my @dark = grep { $snap->{nodes}->{$_}->{online} && exists($snap->{nodes}->{$_}->{samples}) && !$snap->{nodes}->{$_}->{samples} }
+        @all_nodes;
+    if ($quorum_lost) {
+        $fault->(type => 'quorum', message => 'The cluster is not quorate: no moves are recommended until quorum is back');
+    } elsif ($opts{settling}) {
+        $hold = sprintf('the online nodes changed; waiting %d more minute(s) for HA recovery and the load to settle',
+            int(($opts{settling} + 59) / 60));
+    } elsif (@dark) {
+        $hold = "no recent usage data for node(s) " . join(', ', @dark);
+    } elsif (%placement && keys(%no_data) > $STALE_SHARE * keys(%placement)) {
+        $hold = scalar(keys %no_data) . " of " . scalar(keys %placement) . " running guests have no recent usage data";
+    }
+    $fault->(type => 'hold', message => "Load balancing is on hold: $hold; only mandatory moves are recommended") if $hold;
+
     # ---- 1. mandatory ----
     for my $vmid (sort { $a <=> $b } keys %placement) {
         next if !$snap->{nodes}->{$placement{$vmid}}->{maintenance} || $in_pass{$vmid};
@@ -251,39 +319,55 @@ sub pass {
         }
     }
 
-    for my $r (grep { $_->{type} eq 'together' } @$rules) {
-        my @run = grep { defined($placement{$_}) } @{$r->{vms}};
+    # per keep-together unit (rules sharing a VM are fixed as one)
+    my %unit_seen;
+    for my $first (sort { $a <=> $b } keys %$units) {
+        my $unit = $units->{$first};
+        next if $unit_seen{ $unit->[0] }++;
+        my @run = grep { defined($placement{$_}) } @$unit;
         my %on;
         $on{ $placement{$_} }++ for @run;
         next if keys(%on) < 2;
-        # gather on the node that already has most of them, if it can take the rest
-        my $done;
-        for my $node (sort { $on{$b} <=> $on{$a} || $a cmp $b } keys %on) {
+        my %in = map { $_ => 1 } @$unit;
+        my $r = { name => join(',', map { $_->{name} } grep { $_->{type} eq 'together' && $in{ $_->{vms}->[0] } } @$rules) };
+        # gather where it is best after the cost of the moves (soft rules
+        # first, then fewer moves): gathering on the node that has most of
+        # them already would just be balanced away by the next pass
+        my $best;
+        my $obj0 = $ev->{objective};
+        for my $node (@all_nodes) {
             my @move = grep { $placement{$_} ne $node } @run;
-            next if grep { $movable{$_} } @move;
+            next if !@move || grep { $movable{$_} } @move;
             my ($ok) = $valid->(\@move, $node);
             next if !$ok;
-            my $obj0 = $ev->{objective};
-            my $obj = PVE::WDCBalancer::Score::objective_after($snap, $ev, \%placement, \@move, $node, $settings);
-            $record->(\@move, $node, priority => 1, kind => 'rule', reason => 'Fix VM affinity rule violation',
-                gain => $obj - $obj0, rule => $r->{name});
-            $done = 1;
-            last;
+            my $soft = sum0(map { scalar(@{ $violates_soft->($_, $node) }) } @run);
+            my $net = PVE::WDCBalancer::Score::objective_after($snap, $ev, \%placement, \@move, $node, $settings)
+                - $obj0 - move_cost($snap, $settings, \@move);
+            my $c = { node => $node, move => \@move, soft => $soft, net => $net };
+            $best = $c if !$best || $soft < $best->{soft}
+                || ($soft == $best->{soft} && ($net > $best->{net} + 1e-9 || (abs($net - $best->{net}) <= 1e-9 && @move < @{$best->{move}})));
         }
-        $fault->(type => 'rule', rule => $r->{name}, vmids => [ map { $_ + 0 } @run ],
-            message => "Fix VM affinity rule violation: no node can take all of " . join(', ', @run)) if !$done;
+        if ($best) {
+            my $obj = PVE::WDCBalancer::Score::objective_after($snap, $ev, \%placement, $best->{move}, $best->{node}, $settings);
+            $record->($best->{move}, $best->{node}, priority => 1, kind => 'rule', reason => 'Fix VM affinity rule violation',
+                gain => $obj - $obj0, rule => $r->{name});
+        } else {
+            $fault->(type => 'rule', rule => $r->{name}, vmids => [ map { $_ + 0 } @run ],
+                message => "Fix VM affinity rule violation: no node can take all of " . join(', ', @run));
+        }
     }
 
     my $threshold = $settings->{threshold};
 
     # ---- 2. soft rules ----
-    if ($threshold >= 2) {
+    if ($threshold >= 2 && !$hold) {
         for my $vmid (sort { $a <=> $b } keys %placement) {
             my $hit = $violates_soft->($vmid, $placement{$vmid});
             next if !@$hit || $movable{$vmid} || $in_pass{$vmid};
             my @unit = @{ $units->{$vmid} // [ $vmid ] };
             @unit = grep { defined($placement{$_}) } @unit;
-            next if grep { $movable{$_} || $placement{$_} ne $placement{$vmid} } @unit;
+            # a unit member moved earlier in this pass: next pass (one move per guest)
+            next if grep { $movable{$_} || $in_pass{$_} || $placement{$_} ne $placement{$vmid} } @unit;
             my $obj0 = $ev->{objective};
             my ($t, $obj) = $best_target->(\@unit, no_soft => 1);
             if (!$t) {
@@ -298,7 +382,7 @@ sub pass {
 
     # ---- 3. balancing ----
     my $balancing = 0;
-    if ($threshold >= 2) {
+    if ($threshold >= 2 && !$hold) {
         my %seen_unit;
         my @candidates;
         for my $vmid (sort { $a <=> $b } keys %placement) {
@@ -306,30 +390,82 @@ sub pass {
             next if $seen_unit{ $unit[0] }++;
             push @candidates, \@unit;
         }
-        while ($balancing < $settings->{max_moves}) {
+        # A unit balanced earlier in this pass may be balanced again: its
+        # recommendation gets the new target (still one migration, no new
+        # cost), or goes away when the unit is best back where it was (its
+        # cost is saved). Greedy order otherwise leaves a second migration
+        # of the same guest for the next pass.
+        my %bal;    # vmid => its balancing recommendation
+        my %origin; # vmid => node at the start of the pass
+        my $steps = 0;
+        while ($balancing < $settings->{max_moves} && $steps++ < 4 * $settings->{max_moves}) {
+            # within the tolerance only clear wins (priority 2) count, and none
+            # when every VM is happy
+            my $tolerated = $ev->{imbalance} <= ($TOLERANCE{$threshold} // 0);
+            last if $tolerated && !grep { $ev->{scores}->{$_} < $HAPPY } keys %placement;
+            my $limit = $tolerated ? min($threshold, 2) : $threshold;
             my ($best, $best_net, $best_t);
             for my $unit (@candidates) {
-                next if grep { $movable{$_} || $in_pass{$_} } @$unit;
-                next if grep { $now - ($moved->{$_} // 0) < $settings->{cooldown} } @$unit;
+                my $again = !grep { !$bal{$_} } @$unit;
+                next if grep { $movable{$_} || ($in_pass{$_} && !$again) || $no_data{$_} } @$unit;
+                next if !$again && grep { $now - ($moved->{$_} // 0) < $settings->{cooldown} } @$unit;
                 next if grep { $placement{$_} ne $placement{ $unit->[0] } } @$unit;
                 my $cost = move_cost($snap, $settings, $unit);
                 for my $t (@all_nodes) {
-                    next if grep { $now - ($dismissed->{"$_:$placement{$_}:$t"} // 0) < $DISMISS_TTL } @$unit;
+                    my $back = $again && $origin{ $unit->[0] } eq $t;
+                    next if !$back && grep { $now - ($dismissed->{ "$_:" . ($origin{$_} // $placement{$_}) . ":$t" } // 0) < $DISMISS_TTL } @$unit;
                     my ($ok) = $valid->($unit, $t);
                     next if !$ok;
                     next if grep { @{ $violates_soft->($_, $t) } } @$unit;
                     my $net = PVE::WDCBalancer::Score::objective_after($snap, $ev, \%placement, $unit, $t, $settings)
-                        - $ev->{objective} - $cost;
+                        - $ev->{objective} - ($back ? -$cost : $again ? 0 : $cost) - ($back ? 0 : $bounce->($unit, $t));
                     ($best, $best_net, $best_t) = ($unit, $net, $t) if !defined($best_net) || $net > $best_net;
                 }
             }
             last if !$best;
             my $prio = priority_for_gain($best_net);
-            last if !defined($prio) || $prio > $threshold;
-            $record->($best, $best_t, priority => $prio, kind => 'balance',
-                reason => balance_reason($snap, $ev, \%placement, $best, $best_t, $settings), gain => $best_net);
-            $balancing++;
+            last if !defined($prio) || $prio > $limit;
+            my $reason = balance_reason($snap, $ev, \%placement, $best, $best_t, $settings);
+            if (!$bal{ $best->[0] }) {
+                $origin{$_} = $placement{$_} for @$best;
+                my $first = @recs;
+                $record->($best, $best_t, priority => $prio, kind => 'balance', reason => $reason, gain => $best_net);
+                $bal{ $recs[$_]->{vmid} } = $recs[$_] for $first .. $#recs;
+                $balancing++;
+                next;
+            }
+            my %unit = map { $_ => 1 } @$best;
+            if ($origin{ $best->[0] } eq $best_t) {
+                @recs = grep { !$unit{$_->{vmid}} } @recs;
+                for my $vmid (@$best) {
+                    $placement{$vmid} = $best_t;
+                    delete $bal{$vmid};
+                    delete $rec_of{$vmid};
+                    delete $in_pass{$vmid};
+                    delete $origin{$vmid};
+                }
+                $balancing--;
+            } else {
+                for my $vmid (@$best) {
+                    my $r = $bal{$vmid};
+                    $r->{to} = $best_t;
+                    $r->{id} = "$vmid:$r->{from}:$best_t";
+                    $r->{gain} = sprintf('%.1f', $r->{gain} + $best_net) + 0;
+                    $r->{priority} = priority_for_gain($r->{gain}) // 5;
+                    $r->{reason} = $reason;
+                    $placement{$vmid} = $best_t;
+                }
+                # it was planned on the state after all the others: it goes last
+                @recs = ((grep { !$unit{$_->{vmid}} } @recs), (grep { $unit{$_->{vmid}} } @recs));
+            }
+            $ev = PVE::WDCBalancer::Score::evaluate($snap, \%placement, $settings);
         }
+    }
+
+    # without quorum nothing may move (pmxcfs is read-only anyway)
+    if ($quorum_lost) {
+        @recs = ();
+        $ev = $current;
     }
 
     # ---- report ----
@@ -389,6 +525,8 @@ sub pass {
             movable => scalar(grep { !$movable{$_} } keys %movable),
             threshold => $threshold + 0,
             automation => $settings->{automation},
+            $hold ? (hold => $hold) : (),
+            quorate => $quorum_lost ? 0 : 1,
         },
     };
 }

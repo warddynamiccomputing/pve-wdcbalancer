@@ -23,12 +23,26 @@ sub send {
     print "WARNING: could not send notification: $@" if $@;
 }
 
-# Faults that are new since the last pass (by message), so a fault that
-# stays is reported once.
+# What makes a fault the same fault from pass to pass: its type, rule and
+# guests, or, for faults without guests, the message without its numbers
+# (minutes left, counts, sizes change while the cause stays).
+sub fault_key {
+    my ($f) = @_;
+    return join('|', $f->{type} // '', $f->{rule} // '', join(',', sort { $a <=> $b } @{$f->{vmids}}))
+        if $f->{vmids} && @{$f->{vmids}};
+    (my $m = $f->{message} // '') =~ s/\d+(?:\.\d+)?/#/g;
+    return join('|', $f->{type} // '', $f->{rule} // '', $m);
+}
+
+# Not notified: missing data and balancing holds pass by themselves.
+our %QUIET = (data => 1, hold => 1);
+
+# Faults that are new since the last pass, so a fault that stays is
+# reported once.
 sub new_faults {
     my ($old, $new) = @_;
-    my %seen = map { ($_->{message} // '') => 1 } @{$old // []};
-    return [ grep { !$seen{$_->{message} // ''} && ($_->{type} // '') ne 'data' } @{$new // []} ];
+    my %seen = map { fault_key($_) => 1 } @{$old // []};
+    return [ grep { !$seen{ fault_key($_) } && !$QUIET{$_->{type} // ''} } @{$new // []} ];
 }
 
 1;

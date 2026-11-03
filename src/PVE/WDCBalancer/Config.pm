@@ -17,7 +17,12 @@ package PVE::WDCBalancer::Config;
 #   "maintenance": { "<node>": { "since": <epoch>, "user": "..." } }
 # }
 #
-# validate() is pure; load/save/update need pmxcfs.
+# "version" is the schema version. Older configs are upgraded when they are
+# read (and written back upgraded on the next change); a config from a newer
+# release is refused, so a node that wasn't upgraded yet never rewrites it
+# in a format it doesn't know.
+#
+# validate() and migrate() are pure; load/save/update need pmxcfs.
 
 use strict;
 use warnings;
@@ -29,6 +34,10 @@ use PVE::Tools;
 
 our $DIR = '/etc/pve/wdcbalancer';
 our $FILE = "$DIR/config.json";
+
+our $SCHEMA = 1;
+# version => sub upgrading a config from that version to the next
+our %UPGRADE = ();
 
 # name => [ default, check, description ]. The descriptions are shown by the
 # API schema and the GUI.
@@ -61,7 +70,7 @@ my $NAME_RE = qr/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 my $NODE_RE = qr/^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$/;
 
 sub empty {
-    return { version => 1, settings => {}, vm_groups => {}, host_groups => {}, rules => {}, overrides => {}, maintenance => {} };
+    return { version => $SCHEMA, settings => {}, vm_groups => {}, host_groups => {}, rules => {}, overrides => {}, maintenance => {} };
 }
 
 sub defaults {
@@ -214,15 +223,24 @@ sub rule_conflicts {
     my @nodes = sort keys %nodes;
     push @nodes, '(other nodes)'; # a node in no host group
 
-    # 1. keep-together and separate sharing two VMs
+    # 1. keep-together and separate sharing two VMs; keep-together rules
+    #    that share a VM tie all their VMs together
     my @tog = grep { $_->{type} eq 'together' } @$rules;
     my @sep = grep { $_->{type} eq 'separate' } @$rules;
+    my %parent;
+    my $find;
+    $find = sub { my $x = shift; $parent{$x} //= $x; return $parent{$x} eq $x ? $x : ($parent{$x} = $find->($parent{$x})); };
     for my $t (@tog) {
-        my %in = map { $_ => 1 } @{$t->{vms}};
-        for my $s (@sep) {
-            my @both = grep { $in{$_} } @{$s->{vms}};
-            push @err, "rules '$t->{name}' and '$s->{name}' conflict: VMs @both must be kept together and kept apart"
-                if @both >= 2;
+        my @v = @{$t->{vms}};
+        $parent{ $find->($_) } = $find->($v[0]) for @v;
+    }
+    for my $s (@sep) {
+        my %unit;
+        push @{$unit{ $find->($_) }}, $_ for @{$s->{vms}};
+        for my $both (grep { @$_ >= 2 } values %unit) {
+            my @b = sort { $a <=> $b } @$both;
+            my @names = map { $_->{name} } grep { $find->($_->{vms}->[0]) eq $find->($b[0]) } @tog;
+            push @err, "rules '" . join("', '", @names) . "' and '$s->{name}' conflict: VMs @b must be kept together and kept apart";
         }
     }
 
@@ -273,17 +291,38 @@ sub automation_for {
 
 # ---------------- pmxcfs ----------------
 
+# Brings a config to the current schema version (in place).
+sub migrate {
+    my ($cfg) = @_;
+    die "the configuration is not a JSON object\n" if ref($cfg) ne 'HASH';
+    my $v = $cfg->{version} // 1;
+    die "invalid configuration version '$v'\n" if $v !~ /^\d+$/ || $v < 1;
+    die "the configuration was written by a newer pve-wdcbalancer (schema $v, this version reads up to $SCHEMA);"
+        . " upgrade pve-wdcbalancer on this node\n" if $v > $SCHEMA;
+    while ($v < $SCHEMA) {
+        my $up = $UPGRADE{$v} // die "no upgrade from configuration schema $v\n";
+        $up->($cfg);
+        $v++;
+    }
+    $cfg->{version} = $SCHEMA + 0;
+    for my $k (qw(settings vm_groups host_groups rules overrides maintenance)) {
+        $cfg->{$k} //= {};
+        die "configuration: '$k' must be an object\n" if ref($cfg->{$k}) ne 'HASH';
+    }
+    return $cfg;
+}
+
 sub load {
     return empty() if ! -f $FILE;
     my $raw = PVE::Tools::file_get_contents($FILE);
     my $cfg = eval { JSON::PP->new->decode($raw) };
     die "unable to parse $FILE - $@" if $@;
-    $cfg->{$_} //= {} for qw(settings vm_groups host_groups rules overrides maintenance);
-    return $cfg;
+    return migrate($cfg);
 }
 
 sub save {
     my ($cfg) = @_;
+    migrate($cfg);
     my $err = validate($cfg);
     die join("\n", @$err) . "\n" if @$err;
     mkdir($DIR) if ! -d $DIR;
